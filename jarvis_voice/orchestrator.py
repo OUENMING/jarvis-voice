@@ -23,6 +23,7 @@ import numpy as np
 from claude_bridge import ClaudeBridge
 
 from .asr import make_asr
+from .aec import AecGate
 from .audio_io import MicStream, resolve_device
 from .config import JARVIS_HOME, Config
 from .commands import match as match_meta
@@ -77,6 +78,8 @@ class Orchestrator:
         self.tts = make_tts(cfg)
         self.player = Player(self.tts.audio_format,
                              device=resolve_device(getattr(cfg, "output_device", ""), True))
+        # AEC 门：只在 speaker_aec 模式建。必须在 Player 之后（far 参考来自它）。
+        self.aec = AecGate(cfg, self.player) if cfg.aec else None
         sp_file = self._compose_system_prompt()   # 口语规则 + persona.md + memory.md → 落盘
         self.brain = ClaudeBridge(system_prompt="" if sp_file else SYSTEM_PROMPT,
                                   system_prompt_file=sp_file,
@@ -249,10 +252,21 @@ class Orchestrator:
                 chunk = self.mic.read(timeout=0.2)
                 if chunk is None:
                     continue
+                # ---- AEC：先消掉我们自己播的回声，再进电平表与 VAD ----
+                # ⚠️ 必须在电平表**之前** —— 放在之后的话，仪表盘显示的是回声，会误导。
+                if self.aec is not None:
+                    chunk = self.aec.accept(chunk)
                 # 麦克风电平（仪表盘电平表），节流 ~12 次/秒
                 now = time.time()
                 if now - last_level > 0.08:
-                    BUS.emit("level", rms=float(np.sqrt(np.mean(np.square(chunk)))))
+                    rms = float(np.sqrt(np.mean(np.square(chunk))))
+                    if self.aec is not None:
+                        # 播放期间多报一个 WebRTC 自己的语音概率 ——
+                        # 留着事后定 aec_min_speech_prob 的阈值（先测量，再设门限）。
+                        BUS.emit("level", rms=rms,
+                                 speech_prob=round(self.aec.speech_probability, 3))
+                    else:
+                        BUS.emit("level", rms=rms)
                     last_level = now
 
                 # ---- 半双工（免提模式）----
@@ -406,21 +420,32 @@ class Orchestrator:
         的音色，以为是"换了个模型在说话"——其实是设备没切。
         `barge_in`/`half_duplex` 是 cfg 的派生属性，replacing cfg 后自动生效。
         """
-        if mode not in ("headphones", "speaker"):
+        if mode not in ("headphones", "speaker", "speaker_aec"):
             return False
         self.cfg = replace(self.cfg, audio_mode=mode)
-        if mode == "speaker":
+        if mode in ("speaker", "speaker_aec"):
             self._drain(self.utt_q)
             self.vad.reset()
             builtin = self._find_device(("macbook", "built-in", "内置"))
             if builtin is not None:
                 self.player.reopen(builtin)
         else:
-            self.player.reopen(None)          # 耳机模式 = 跟系统默认
+            self.player.reopen(None)
+        # AEC 门跟着模式建/拆/重置。
+        # ⚠️ 必须在 player.reopen() **之后** —— reopen 会把 far 绝对帧号归零，
+        # 而 `AecGate._far_read` 是 44.1k 绝对帧指针，不重置就会指向不存在的过去。
+        if self.cfg.aec:
+            if self.aec is None:
+                self.aec = AecGate(self.cfg, self.player)
+            else:
+                self.aec.reset()
+        else:
+            self.aec = None
         self.log(f"[控制] 模式 → {mode}（打断={'开' if self.cfg.barge_in else '关'}, "
-                 f"半双工={'开' if self.cfg.half_duplex else '关'}）")
+                 f"半双工={'开' if self.cfg.half_duplex else '关'}, "
+                 f"AEC={'开' if self.cfg.aec else '关'}）")
         BUS.emit("mode", value=mode, barge_in=self.cfg.barge_in,
-                 half_duplex=self.cfg.half_duplex)
+                 half_duplex=self.cfg.half_duplex, aec=self.cfg.aec)
         return True
 
     @staticmethod

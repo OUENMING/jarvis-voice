@@ -264,6 +264,15 @@ main{max-width:960px;margin:0 auto;padding:14px 20px 40px}
 const $=s=>document.querySelector(s);
 const feed=$('#feed'), empty=$('#empty'), meter=$('#meter'), stats=$('#stats');
 let paused=false, mode='headphones', turns=0, interrupts=0, cost=0;
+// 三档音频模式，按钮循环切换。`btn` 是"点一下会切到哪档"（沿用原来的语义）。
+// ⚠️ speaker（无 AEC 免提）**刻意保留**：验收 AEC 时要拿它当对照基线 ——
+// 只看 AEC 模式的失败会把"用户自己说话太慢"误判成"是 AEC 的锅"。
+const MODES={
+  headphones :{label:'耳机 · 可插话打断',    cls:'chip',          next:'speaker_aec', btn:'免提+AEC'},
+  speaker_aec:{label:'免提+AEC · 可插话打断', cls:'chip',          next:'speaker',     btn:'免提(无AEC)'},
+  speaker    :{label:'免提 · 不能插话打断',  cls:'chip warnchip', next:'headphones',  btn:'耳机'},
+};
+const modeInfo=m=>MODES[m]||MODES.speaker;
 let first=[], asr=[];
 let filter='all';
 
@@ -357,16 +366,12 @@ function on(ev){
     add(w);break;}
   case 'done': if(ev.cost!=null){cost+=Number(ev.cost);updStats();} break;
   case 'mode':{
-    mode=ev.value;
-    const b=$('#btnMode');
-    b.lastChild.textContent = mode==='headphones' ? '免提' : '耳机';
-    b.title = mode==='headphones'
-      ? '当前耳机模式（可插话打断）→ 点一下切免提' : '当前免提模式（不能插话打断）→ 点一下切耳机';
-    document.getElementById('modeChip').textContent =
-      mode==='headphones' ? '耳机 · 可插话打断' : '免提 · 不能插话打断';
-    document.getElementById('modeChip').className =
-      mode==='headphones' ? 'chip' : 'chip warnchip';
-    note('warn','bolt','切到'+(mode==='headphones'?'耳机（可插话打断）':'免提（不能插话打断）'));
+    mode=ev.value; const mi=modeInfo(mode), b=$('#btnMode');
+    b.lastChild.textContent = mi.btn;
+    b.title = '当前：'+mi.label+' → 点一下切下一档';
+    const chip=document.getElementById('modeChip');
+    chip.textContent=mi.label; chip.className=mi.cls;
+    note('warn','bolt','切到'+mi.label);
     break;}
   case 'device': note('','chat','输出设备 → '+(ev.name||ev.index)); break;
   case 'meta':{
@@ -423,7 +428,7 @@ async function ctl(action, value){
 }
 $('#btnPause').onclick=()=>ctl(paused?'resume':'pause');
 $('#btnStop').onclick=()=>ctl('interrupt');
-$('#btnMode').onclick=()=>ctl('mode', mode==='headphones'?'speaker':'headphones');
+$('#btnMode').onclick=()=>ctl('mode', modeInfo(mode).next);
 $('#btnVault').onclick=()=>ctl('reconnect');
 // ⚠️ 关闭**刻意不走 ctl()**：ctl 有 ctlBusy 门闩，若上一次控制请求卡住，关闭会被一起冻住
 //    （真机踩过：点了没反应）。这里自带请求，且不 await 结果——进程马上就没，连接断是预期。
@@ -475,12 +480,13 @@ def index():
     看不到就会以为坏了）。服务端本来就知道 —— 直接写进 HTML，零时序依赖。
     """
     cfg = getattr(ORCH, "cfg", None)
-    if cfg is not None and not cfg.barge_in:
-        label = "免提 · 不能插话打断"
-        cls = "chip warnchip"
+    m = cfg.audio_mode if cfg is not None else "headphones"
+    if m == "speaker_aec":
+        label, cls = "免提+AEC · 可插话打断", "chip"
+    elif m == "speaker":
+        label, cls = "免提 · 不能插话打断", "chip warnchip"
     else:
-        label = "耳机 · 可插话打断"
-        cls = "chip"
+        label, cls = "耳机 · 可插话打断", "chip"
     page = PAGE.replace(
         '<span class="chip" id="modeChip">__MODE__</span>',
         f'<span class="{cls}" id="modeChip" title="音频模式">{label}</span>')

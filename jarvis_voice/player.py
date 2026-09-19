@@ -19,6 +19,9 @@ from .tts.base import AudioFormat
 
 BLOCK_FRAMES = 1024
 
+# AEC 的 far 参考镜像保留多久。2s 够用（AEC3 自估的延迟在 200ms 量级），3s 留余量。
+AEC_FAR_SEC = 3.0
+
 
 class Player:
     def __init__(self, fmt: AudioFormat, device: int | None = None,
@@ -39,6 +42,16 @@ class Player:
         # 抢同一把锁，长回答时可能 xrun/爆音（审计发现）。
         self._buffered = 0
         self._device = device
+        # ---- far 参考镜像（AEC 用：我们**确切知道**在播什么）----
+        # ⚠️ 按**绝对帧号**索引，读指针由 `_emitted`（回调真正写出去的帧数）兜底，
+        #    而不是由 write() 决定。否则 flush()（打断）之后，那些**进了缓冲但永远
+        #    不会被播出来**的帧会变成"幽灵参考信号"→ far 与 near 错位 → AEC 自我保护
+        #    性停用，而这恰好发生在最需要它的打断瞬间。（P-2，踩过）
+        self._far_cap = int(self.fmt.sample_rate * AEC_FAR_SEC)
+        self._far = np.zeros(self._far_cap, dtype=np.int16)   # 环形数组，O(1) 追加
+        self._far_total = 0       # 历史累计写入帧数（绝对帧号的上界）
+        self._emitted = 0         # 回调真正写出去的绝对帧数（单写者，同 _uptime）
+        self._far_lock = threading.Lock()
         self._stream: sd.OutputStream | None = None
         self._open_stream()
 
@@ -67,6 +80,12 @@ class Player:
             self._buf.clear()
             self._buffered = 0
         self._had_audio = False
+        # 换设备 = 换了一条声学路径，旧 far 参考全部作废（也把 _emitted 归零，
+        # 新流的帧号从 0 重新计）。
+        with self._far_lock:
+            self._far[:] = 0
+            self._far_total = 0
+        self._emitted = 0
         self._open_stream()
         if was_running:
             self._stream.start()
@@ -108,6 +127,9 @@ class Player:
             self._played_audio += filled
             self._buffered -= filled
         self._uptime += frames          # 仅统计用，单写者，不必在锁内
+        # AEC 的 far 读指针基准：**只在这里**推进，代表"真的播出去了多少"。
+        # 单写者（回调）+ CPython 整数读写原子 → 不必加锁（同 _uptime 的理由）。
+        self._emitted += frames
 
     # ---- 生命周期 ----
     def start(self):
@@ -134,6 +156,51 @@ class Player:
             buf = arr.reshape(-1, self.fmt.channels)
             self._buf.append((buf, tag))
             self._buffered += buf.shape[0]
+        # far 参考镜像：记下"进了播放队列的原始 44.1k 波形"。
+        # ⚠️ 这里**只存不重采样** —— 重采样必须在消费侧做（见 aec.py 的说明）。
+        self._mirror_far(arr)
+
+    def _mirror_far(self, arr: np.ndarray) -> None:
+        """把 44.1k int16 写进环形数组。绝对帧号 f 恒映射到 `f % _far_cap`。"""
+        n = arr.shape[0]
+        if n == 0:
+            return
+        with self._far_lock:
+            if n >= self._far_cap:
+                arr, n = arr[-self._far_cap:], self._far_cap
+            start = self._far_total % self._far_cap
+            end = start + n
+            if end <= self._far_cap:
+                self._far[start:end] = arr
+            else:
+                k = self._far_cap - start
+                self._far[start:] = arr[:k]
+                self._far[:end - self._far_cap] = arr[k:]
+            self._far_total += n
+
+    def emit_frames(self) -> int:
+        """回调**真正写到输出**的绝对帧数（44.1k）。AEC far 读指针的硬上界。"""
+        return self._emitted
+
+    def far_slice(self, start_frame: int, n_frames: int) -> np.ndarray:
+        """取绝对帧区间 [start_frame, start_frame + n_frames) 的 far 参考（44.1k int16）。
+
+        **两个硬边界**：
+          · 不读未来 —— 截到 `emit_frames()`（P-2：未播出的帧不是参考信号）
+          · 不读已滚掉的过去 —— 截到 `_far_total - _far_cap`
+        返回**实际可用**的部分（可能短于请求，也可能为空）。读指针只增不减。
+
+        ⚠️ 边界计算必须在 `_far_lock` **内**做完：`_far_total` 会在锁外被写线程推进，
+        锁外算出的 `lo` 可能已落在被新数据覆盖的位置上 → 返回一份新旧混着的参考。
+        （`_emitted` 只有回调写，且恒 <= `_far_total`，锁外读是安全的。）
+        """
+        with self._far_lock:
+            total = self._far_total
+            lo = max(0, int(start_frame), total - self._far_cap)
+            hi = min(int(start_frame) + max(0, int(n_frames)), total, self._emitted)
+            if hi <= lo:
+                return np.zeros(0, dtype=np.int16)
+            return self._far[np.arange(lo, hi) % self._far_cap].copy()
 
     def cut_tag(self, tag: str) -> float:
         """把缓冲里该标签的音频整段切掉，返回切掉的秒数。

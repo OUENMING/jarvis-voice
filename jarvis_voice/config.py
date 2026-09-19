@@ -108,7 +108,19 @@ class Config:
     # speaker:    免提（内置麦 + 扬声器）。麦克风会听到**音箱里的自己**，而我们不做 AEC，
     #             所以必须两件事一起关：① 关自动打断 ② 播放期间不听（**半双工**）。
     #             只关打断是不够的——自己的声音仍会被转写并送去 CC。
+    # speaker_aec: 免提 + 软件 AEC。far 参考来自 Player 的镜像（我们**确切知道**在播什么），
+    #             WebRTC AEC3 消掉它 → 可以**免提 + 打断**。实测本机稳态 ERLE 34–36 dB
+    #             （docs/PROBE-AEC-RESULTS-20260919.md）。
     audio_mode: str = "headphones"
+
+    # ---- AEC（仅 audio_mode == "speaker_aec" 生效）----
+    # 延迟粗值即可 —— AEC3 自带 delay estimator，实测 0 与 100 无差别。
+    aec_stream_delay_ms: int = 150
+    # 注：`RESEARCH-AEC-20260919.md` §2.3 的三层防线（播放期间抬高 SNR 门限 /
+    # speech_probability 双确认）**尚未实现** —— 那两个阈值没有实测数据可依据，
+    # 先不设死配置（避免重犯 §7.5「死配置」的坑）。当前靠已有的段级 SNR 门限
+    # + `asr_min_utt_sec` + `echoguard` 三层兜底；`orchestrator` 已在播放期间
+    # 把 `speech_probability` 报进 `level` 事件，攒够数据再定阈值。
 
     # ---- 填充音 ----
     filler_enabled: bool = True
@@ -161,15 +173,23 @@ class Config:
     say_voice: str = "Tingting"
 
     # ---- 由 audio_mode 派生的行为（单一事实来源，避免两处开关打架）----
+    # ⚠️ 必须写成**白名单**。曾经的写法是 `half_duplex = audio_mode != "headphones"`——
+    # 那是黑名单：加任何新模式都会静默判 True，麦克风照样被丢，AEC 接了等于没接，
+    # **而且不报任何错**。加 "speaker_aec" 时踩到过。
     @property
     def barge_in(self) -> bool:
-        """是否允许**自动**打断。免提模式必须关（无 AEC，会打断自己）。"""
-        return self.audio_mode == "headphones"
+        """是否允许**自动**打断。耳机与 AEC 免提都可以（AEC 消掉了自己的回声）。"""
+        return self.audio_mode in ("headphones", "speaker_aec")
 
     @property
     def half_duplex(self) -> bool:
-        """播放期间是否忽略麦克风。免提模式必须开，否则自己的声音会被转写送去 CC。"""
-        return self.audio_mode != "headphones"
+        """播放期间是否忽略麦克风。**只有无 AEC 的免提**才需要。"""
+        return self.audio_mode == "speaker"
+
+    @property
+    def aec(self) -> bool:
+        """是否启用软件回声消除。"""
+        return self.audio_mode == "speaker_aec"
 
     @classmethod
     def load(cls) -> "Config":
@@ -180,6 +200,8 @@ class Config:
             model, window = MODELS / "vad" / "ten-vad.onnx", 256
         return cls(
             audio_mode=_env_str("JARVIS_AUDIO_MODE", cls.audio_mode),
+            # AEC：延迟只给粗值（AEC3 自估）
+            aec_stream_delay_ms=_env_int("JARVIS_AEC_DELAY_MS", cls.aec_stream_delay_ms),
             resume_session=os.environ.get("JARVIS_RESUME") == "1",
             persona_file=_env_str("JARVIS_PERSONA", str(JARVIS_HOME / "persona.md")),
             memory_file=_env_str("JARVIS_MEMORY", str(JARVIS_HOME / "memory.md")),
