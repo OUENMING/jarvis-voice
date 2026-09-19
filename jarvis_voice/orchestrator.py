@@ -55,10 +55,28 @@ SYSTEM_PROMPT = (
     "   只有真需要外部信息时才用。\n"
     "10. 主人说'停''别说了''安静'时**不用回应**——系统会直接让你闭嘴。\n"
     "11. 你**能操作浏览器**（开新窗口/标签页、导航、点击、填表、读页面）。主人说\n"
-    "    '开个新窗口''打开…''看看这个网页'时，用浏览器工具做，做完用一句话回报结果。"
+    "    '开个新窗口''打开…''看看这个网页'时，用浏览器工具做，做完用一句话回报结果。\n"
+    "12. ⛔ **浏览器里撞上登录页就停手。** 看到 SSO / 登录表单 / 'Sign in' 页面时：\n"
+    "    **不要**填账号密码、**不要**找表单提交（`form.submit()` / `requestSubmit()`）、\n"
+    "    **不要**挨个点按钮试。**直接说一句**「XX 的登录过期了，你去浏览器里登一下」，然后结束。\n"
+    "    实测教训（2026-09-19）：让它自己试登录，**一次烧掉 28 步工具调用**、七十多秒，全在摸索\n"
+    "    登录表单。主人的浏览器里登一次就永久解决，机器试一次都不该试。\n"
+    "13. **Microsoft / Google / 学校 SSO 的二次验证（2FA）机器过不去** —— 那不是你能碰的，\n"
+    "    直接请主人来。"
 )
 
-# 第二大脑（Obsidian）热重连。server 名须与 mcp-jarvis.local.json 里的 **完全一致**。
+# 登录页哨兵：navigate 的目标 URL 命中这些标记就判为"撞上登录页"。
+# 用途是**观测**（发 login_required 事件），不是硬中断 —— 硬中断要在消费生成器的
+# 循环里调 brain.interrupt()，有死锁风险（见 _login_target 的注释）。
+#
+# ⚠️ host 与 path **分开匹配**：单纯子串匹配的话，"auth" 会误命中 `author`、
+# `authentication-guide`；按 host 前缀 / path 段匹配才准。
+LOGIN_HOST_MARKERS = (
+    "sso.", "login.", "signin.", "sign-in.", "idp.", "adfs.", "auth.",
+    "login.microsoftonline", "accounts.google", "shibboleth",
+)
+LOGIN_PATH_MARKERS = ("/login", "/signin", "/sign-in", "/sso", "/auth/", "/idp", "/adfs")
+
 MEMORY_SERVER = "obsidian-vault"
 OBSIDIAN_PORT = 27124
 
@@ -347,6 +365,33 @@ class Orchestrator:
                 q.get_nowait()
             except queue.Empty:
                 return
+
+    @staticmethod
+    def _login_target(ev: dict) -> str | None:
+        """这次工具调用是不是在往登录页走？是就返回目标 host（用于回报给主人）。
+
+        只认 `mcp__browser__navigate` —— 那是最清晰的信号。`find`/`computer` 也可能
+        落在登录页上，但从入参看不出 URL（只有关键词/坐标），**不猜**。
+
+        ⚠️ **只观测，不中断**。要硬停就得在这个位置调 `_do_interrupt()`，而它会调
+        `self.brain.interrupt()` —— 我们此刻正踩在消费 `gen` 的循环里，有死锁风险。
+        先用事件确认「提示词规则 12 有没有起作用」，有证据再谈硬停。
+        """
+        if ev.get("name") != "mcp__browser__navigate":
+            return None
+        url = str((ev.get("input") or {}).get("url", "") or "")
+        if not url:
+            return None
+        try:
+            from urllib.parse import urlparse
+            host = (urlparse(url).hostname or "").lower()
+            path = (urlparse(url).path or "").lower()
+        except Exception:
+            return None
+        if any(host.startswith(m) or m in host for m in LOGIN_HOST_MARKERS) \
+                or any(p in path for p in LOGIN_PATH_MARKERS):
+            return host or url[:60]
+        return None
 
     def _note_spoken(self, text: str) -> None:
         """记一句「实际要念出去」的文本，供回声护栏比对。
@@ -655,6 +700,12 @@ class Orchestrator:
                 elif et == "tool":
                     self.log(f"  [工具] {ev.get('name')}")
                     BUS.emit("tool", name=ev.get("name"), input=ev.get("input"))
+                    # 登录页哨兵（**观测**）：规则 12 要求模型撞上登录页就停手，
+                    # 这个事件用来验证它到底有没有照做。没有这个数就不知道规则有没有用。
+                    _host = self._login_target(ev)
+                    if _host:
+                        self.log(f"[login] ⚠️ 奔向登录页 {_host} —— 规则 12 本应让它停手")
+                        BUS.emit("login_required", host=_host, tool=ev.get("name"))
                 elif et in ("done", "interrupted", "error"):
                     if et == "error":
                         self.log(f"  [错误] {ev.get('error')}")
