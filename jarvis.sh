@@ -56,6 +56,7 @@ case "${1:-start}" in
   restart) shift || true; stop_all; start "$@" ;;
   status)  status ;;
   *) echo "用法: $0 {start|stop|restart|status} [jarvis 参数...]"
-     echo "例:   $0 start --speaker --dashboard"
-     echo "      JARVIS_OUTPUT_DEVICE=MacBook $0 start --speaker" ;;
+     echo "例:   $0 start --speaker-aec --dashboard   # 免提+软件AEC（可插话打断）"
+     echo "      $0 start --speaker --dashboard       # 免提无AEC（对照）"
+     echo "      $0 start --dashboard                 # 耳机" ;;
 esac

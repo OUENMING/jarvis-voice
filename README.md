@@ -13,13 +13,18 @@ Claude Code 是"脑"——它**有工具**(Bash/Edit/Read + Tavily 搜索 + 浏�
 
 ```bash
 ./jarvis.sh start --dashboard      # 耳机模式 + 可视化仪表盘
-./jarvis.sh start --speaker        # 免提(需 JARVIS_OUTPUT_DEVICE=MacBook,否则输出仍走耳机)
+./jarvis.sh start --speaker-aec    # 免提 + 软件 AEC：免提也能插话打断（自动切内置扬声器）
+./jarvis.sh start --speaker        # 免提但**无 AEC**：播出时不听麦克风，不能插话
+                                   #（对照用；需 JARVIS_OUTPUT_DEVICE=MacBook）
 ./jarvis.sh start --fresh          # 不复用上次对话（**默认会 resume**，见下）
 ./jarvis.sh status                 # 看有几个实例在跑
 ./jarvis.sh stop
 ```
 
 ⚠️ **一定用 `jarvis.sh` 而不是手动 `pkill`** —— 详见下面「踩过的坑」。
+⚠️ **`--speaker-aec` 只消「我们自己播的」回声。** 环境里别人的声音（网课、视频、
+别人的语音）它消不掉——那需要说话人分离，是另一条路（见
+`docs/RESEARCH-AEC-20260919.md` §2.4）。放视频时请用耳机。
 
 需要 `~/.jarvis/fish.env` 里有 `FISH_API_KEY`,以及 `claude` CLI 已登录。
 
@@ -91,4 +96,5 @@ Obsidian 起来后说一句「**连上第二大脑**」即可热重连（走 `mc
 - `--disallowedTools` 拦了 31 条破坏性命令(递归删除/sudo/强制 push/管道执行等)。
   ⚠️ **这是防手滑的护栏,不是沙箱** —— `bash -c "rm -rf /"` 之类能绕。
 - 免提模式(无 AEC)会**关闭自动打断并改为半双工**,防止麦克风听到音箱里的自己。
+  装了 AEC 之后(`--speaker-aec`)这两个限制都解除：免提也能插话打断。
 - 仪表盘只绑 `127.0.0.1`,代码里 `assert` 强制。
