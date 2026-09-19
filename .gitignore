@@ -1,0 +1,21 @@
+# ---- 环境与模型：体积大（合计 677M），不入库 ----
+.venv/
+models/
+
+# ---- Python 产物 ----
+__pycache__/
+*.py[cod]
+
+# ---- 明文密钥：真实凭据只留在本地 ----
+# 需要时用 JARVIS_MCP_CONFIG 指向别处；结构见 mcp-jarvis.example.json
+mcp-jarvis.local.json
+mcp-jarvis.json
+mcp-search.json
+
+# ---- 运行时产物 / 备份 / 测试录音 ----
+*.log
+*.bak
+*.bak-*
+*.bak_*
+*.wav
+.DS_Store
