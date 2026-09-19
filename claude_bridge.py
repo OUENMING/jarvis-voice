@@ -63,7 +63,8 @@ class ClaudeBridge:
     def __init__(self, system_prompt: str = "", model: str = "haiku",
                  allowed_tools: list[str] | None = None, cwd: str | None = None,
                  disallowed_tools: list[str] | None = None,
-                 resume: bool = False, system_prompt_file: str | None = None):
+                 resume: bool = False, system_prompt_file: str | None = None,
+                 bare: bool = True):
         """`resume=False` 是**刻意的默认**。
 
         ⚠️ 真机踩过：默认开启持久化时，**测试脚本与正式应用共用同一个
@@ -98,6 +99,32 @@ class ClaudeBridge:
         self._control: dict[str, dict] = {}     # rid → {"ev": Event, "resp": dict}（通用控制帧回执）
 
     # ---------- 生命周期 ----------
+    @staticmethod
+    def _write_min_settings() -> str:
+        """非 bare 模式用：写一份「插件全关」的 settings，返回路径。
+
+        为什么要关：实测那 3 个插件（claude-mem / discernment-nudge / i-have-adhd）
+        在**常驻会话**里值 400ms/轮 —— 关掉后非 bare 只比 bare 贵 156ms。
+        ⚠️ **动态读**用户现有插件列表再逐个置 false，不硬编码名字 ——
+        否则用户新装了插件就漏关（而且会静默地慢）。
+        """
+        import json
+        from pathlib import Path
+        src = Path.home() / ".claude" / "settings.json"
+        plugins = {}
+        try:
+            if src.exists():
+                plugins = {k: False for k in (json.loads(src.read_text()).get("enabledPlugins") or {})}
+        except Exception:
+            plugins = {}
+        out = Path(os.environ.get("JARVIS_HOME", str(Path.home() / ".jarvis"))) / "brain-settings.json"
+        try:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps({"enabledPlugins": plugins}, indent=1))
+        except Exception:
+            return str(src)          # 写不了就退回用户原配置（宁可慢也别起不来）
+        return str(out)
+
     def start(self):
         """起子进程。⚠️ 双向模式下 init 在首条消息后才返回，此处不等；ask() 负责等。"""
         cmd = [
@@ -107,9 +134,16 @@ class ClaudeBridge:
             "--include-partial-messages",
             "--verbose",
             "--model", self.model,
-            "--bare",
             "--dangerously-skip-permissions",  # 受 allowed_tools 白名单约束
         ]
+        # 启动模式：bare 快但**没有 skills / ToolSearch / WebSearch**。
+        # 常驻会话实测（同一进程 6 轮稳态中位）：bare 929ms / 非bare 1483ms /
+        # **非bare+插件全关 1085ms** —— 所以非 bare 时把插件关掉，只贵 156ms。
+        self.bare = bare
+        if bare:
+            cmd.append("--bare")
+        else:
+            cmd += ["--settings", self._write_min_settings()]
         # 记忆注入：优先**文件**（persona+memory 合成）。一手验证（2026-09-16，2.1.266）：
         #   ✅ --system-prompt-file 内容真进上下文（替换默认提示，与旧 --system-prompt 同语义）
         #   ✅ --append-system-prompt-file 也能追加

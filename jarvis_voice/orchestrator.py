@@ -109,6 +109,7 @@ class Orchestrator:
                                   system_prompt_file=sp_file,
                                   model=cfg.brain_model,
                                   disallowed_tools=list(cfg.bash_deny),
+                                  bare=cfg.brain_bare,
                                   resume=cfg.resume_session)
 
         self.utt_q: queue.Queue = queue.Queue(maxsize=8)

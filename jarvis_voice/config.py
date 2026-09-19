@@ -147,6 +147,22 @@ class Config:
     echo_guard_window_s: float = 12.0 # 只跟最近这么久内说过的文本比
 
     brain_model: str = "haiku"
+
+    # ---- 脑进程启动模式（2026-09-19 常驻会话实测标定）----
+    # `--bare` 会关掉 hooks / LSP / plugin sync / auto-memory / keychain /
+    # CLAUDE.md 自动发现 —— **以及 skills 和 ToolSearch**。
+    #
+    # 常驻会话实测（同一进程跑 6 轮，稳态中位）：
+    #   --bare              929 ms   无 skills / 无懒加载 / 无 WebSearch
+    #   非 bare            1483 ms   +554ms，拿到 skills + ToolSearch(99 deferred) + WebSearch
+    #   非 bare+插件全关    1085 ms   +156ms   ← **推荐**
+    # → 那 400ms 差是插件的启动开销（claude-mem / discernment-nudge / i-have-adhd）。
+    #   ⚠️ claude-mem 尤其别放进语音脑：它有自己的「死循环 + 30000ms 超时」史。
+    #
+    # ⚠️ **别用 `claude --print` 测这个** —— 那是单次进程，每次付冷启动，
+    #    会量出「+3.6 秒」的假数（真值只有 156ms）。必须用常驻进程量。
+    brain_bare: bool = True
+
     # ⚠️ **默认关闭**（血的教训）。`--resume` 会**链式**生成新会话，每次恢复都继承
     # 上一次的全部上下文 —— 于是**任何**污染过的会话都会永久烘焙进链条，一直传下去。
     # 真机踩过两次：助手带着"数到40/在的/我还活着"（我的测试对话）醒来，
@@ -212,6 +228,7 @@ class Config:
             audio_mode=_env_str("JARVIS_AUDIO_MODE", cls.audio_mode),
             # AEC：延迟只给粗值（AEC3 自估）
             aec_stream_delay_ms=_env_int("JARVIS_AEC_DELAY_MS", cls.aec_stream_delay_ms),
+            brain_bare=os.environ.get("JARVIS_BARE", "1") == "1",
             resume_session=os.environ.get("JARVIS_RESUME") == "1",
             persona_file=_env_str("JARVIS_PERSONA", str(JARVIS_HOME / "persona.md")),
             memory_file=_env_str("JARVIS_MEMORY", str(JARVIS_HOME / "memory.md")),
@@ -234,7 +251,6 @@ class Config:
             tts_provider=_env_str("JARVIS_TTS", cls.tts_provider),            fish_voice=_env_str("FISH_VOICE", cls.fish_voice),
             fish_model=_env_str("FISH_MODEL", cls.fish_model),
             fish_latency=_env_str("FISH_LATENCY", cls.fish_latency),
-            fish_use_websocket=os.environ.get("FISH_WS", "0") == "1",
-            fish_temperature=_env_float("FISH_TEMPERATURE", cls.fish_temperature),
+            fish_use_websocket=os.environ.get("FISH_WS", "0") == "1",            fish_temperature=_env_float("FISH_TEMPERATURE", cls.fish_temperature),
             say_voice=_env_str("JARVIS_SAY_VOICE", "Tingting"),
         )
