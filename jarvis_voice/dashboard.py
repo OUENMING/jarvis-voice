@@ -184,13 +184,13 @@ main{max-width:960px;margin:0 auto;padding:14px 20px 40px}
 
 .msg{display:flex;flex-direction:column;max-width:80%}
 .msg.me{align-self:flex-end;margin-left:auto;align-items:flex-end}
-.msg.omen{align-items:flex-start}
+.msg.aries{align-items:flex-start}
 .who{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--faint);
   margin:0 8px 3px}
 .bub{padding:9px 13px;border-radius:var(--r);border:1px solid var(--line);
   white-space:pre-wrap;word-break:break-word}
 .me .bub{background:var(--u-surf)}
-.omen .bub{background:var(--a-surf)}
+.aries .bub{background:var(--a-surf)}
 .fact{font-size:11.5px;color:var(--faint);margin:3px 8px 0;display:flex;gap:10px;
   flex-wrap:wrap;align-items:center}
 .lat{color:var(--faint)}
@@ -356,7 +356,7 @@ function on(ev){
     add(d);break;}
   case 'sentence':{
     const w=el('div','ev');w.dataset.f='talk';
-    const m=el('div','msg omen');m.appendChild(el('div','who','omen'));
+    const m=el('div','msg aries');m.appendChild(el('div','who','aries'));
     m.appendChild(el('div','bub',ev.text));w.appendChild(m);
     const f=el('div','fact');
     if(ev.first_ms!=null){f.appendChild(el('span','lat'+(ev.first_ms>3000?' slow':''),

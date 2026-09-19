@@ -67,8 +67,10 @@ class Config:
     asr_fixes: tuple[tuple[str, str], ...] = (
         ("杜柏林", "都柏林"),
         ("都布林", "都柏林"),
-        ("欧men", "Omen"),
-        ("欧门", "Omen"),
+        ("艾瑞斯", "Aries"),
+        ("阿瑞斯", "Aries"),
+        ("阿里斯", "Aries"),
+        ("埃里斯", "Aries"),
         ("悠文", "欧文"),
     )
 

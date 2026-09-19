@@ -20,7 +20,7 @@ import sounddevice as sd
 from jarvis_voice.config import Config
 from jarvis_voice.tts import make_tts
 
-SENTENCES = ["你好，我是 Omen。", "今天都柏林的天气还行，", "要不要我帮你查一下明天要不要带伞？"]
+SENTENCES = ["你好，我是 Aries。", "今天都柏林的天气还行，", "要不要我帮你查一下明天要不要带伞？"]
 
 
 def play_pcm(chunks, fmt, label=""):
