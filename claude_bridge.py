@@ -79,6 +79,7 @@ class ClaudeBridge:
         self.allowed_tools = allowed_tools or []
         self.disallowed_tools = disallowed_tools or []
         self.resume = resume
+        self.bare = bare
         self.cwd = cwd or os.getcwd()
         self.proc: subprocess.Popen | None = None
         self.session_id: str | None = None
@@ -139,8 +140,7 @@ class ClaudeBridge:
         # 启动模式：bare 快但**没有 skills / ToolSearch / WebSearch**。
         # 常驻会话实测（同一进程 6 轮稳态中位）：bare 929ms / 非bare 1483ms /
         # **非bare+插件全关 1085ms** —— 所以非 bare 时把插件关掉，只贵 156ms。
-        self.bare = bare
-        if bare:
+        if self.bare:
             cmd.append("--bare")
         else:
             cmd += ["--settings", self._write_min_settings()]
