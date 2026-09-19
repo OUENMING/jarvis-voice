@@ -23,6 +23,7 @@
 | `LANDABILITY-AUDIT-20260916.md` | 落地性 / 实现效果 / 前沿性 |
 | **`RESEARCH-UPGRADE-PLAN-20260919.md`** | ⭐ **打断/端点/状态清理升级计划** —— 4 个参考实现的一手源码阅读（Handy / LiveKit Agents / HF speech-to-speech / silero）+ 与本文档库既有结论的对齐。含「音频路径卡住即哑」的世代判断+看门狗修法、话首切字的预滚方案（**含 SNR 顺序陷阱**）、`<transcript>` 注入隔离。**§7 的验收纪律沿用 `VERIFY-TURN-DETECTION-20260916.md`** |
 | `WORKORDER-01-master-verify.md` | 核实任务书 |
+| **`WORKORDER-AEC-01.md`** | ⭐ **AEC 接入施工单（当前活跃）** —— 逐文件/带行号的改动清单。含**两个设计文档漏掉的坑**：`config.py` 的 `half_duplex` 是黑名单会静默吃掉新模式（P-1）；`flush()` 会让 far 参考跑到"未来"、恰好在打断瞬间废掉 AEC（P-2）。§2.3 含**重采样必须在消费侧**的实测依据（生产侧掉 13.15 dB） |
 
 ## archive/（描述已废弃的双脑架构）
 
