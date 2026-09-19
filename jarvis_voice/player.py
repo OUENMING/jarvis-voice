@@ -43,14 +43,18 @@ class Player:
         self._buffered = 0
         self._device = device
         # ---- far 参考镜像（AEC 用：我们**确切知道**在播什么）----
-        # ⚠️ 按**绝对帧号**索引，读指针由 `_emitted`（回调真正写出去的帧数）兜底，
-        #    而不是由 write() 决定。否则 flush()（打断）之后，那些**进了缓冲但永远
-        #    不会被播出来**的帧会变成"幽灵参考信号"→ far 与 near 错位 → AEC 自我保护
-        #    性停用，而这恰好发生在最需要它的打断瞬间。（P-2，踩过）
+        # ⚠️⚠️ **必须在音频回调里写，用 `outdata` 本身** —— 不能用 `write()` 里塞进来的
+        # 音频。原因：`write()` 记的是"TTS 往队列里放了多少帧"，而回调才是"扬声器真的
+        # 出了多少帧"。空闲时回调照样按实时输出**静音**并推进，两者是不同的时钟：
+        #   空闲 15s → 回调已出 661500 帧，而镜像里只有 0 帧
+        #   → 读指针被设到 654885（远超镜像数据量）→ `far_slice` 永远返回空
+        #   → **AEC 拿到的 far 参考是全零 → 什么都没消 → 扬声器的声音原样进麦克风**。
+        # 真机踩到过（2026-09-19，日志 session #7：切到 speaker_aec 时本 session 还
+        # 没说过话，`_far_total=0` 而 `_emitted` 已 66 万）。
+        # 用 `outdata` 之后：镜像 ≡ 实际播放信号（含静音），**只有一个时钟**。
         self._far_cap = int(self.fmt.sample_rate * AEC_FAR_SEC)
         self._far = np.zeros(self._far_cap, dtype=np.int16)   # 环形数组，O(1) 追加
-        self._far_total = 0       # 历史累计写入帧数（绝对帧号的上界）
-        self._emitted = 0         # 回调真正写出去的绝对帧数（单写者，同 _uptime）
+        self._far_w = 0           # 回调累计输出过的帧数（绝对帧号 = 播放位置）
         self._far_lock = threading.Lock()
         self._stream: sd.OutputStream | None = None
         self._open_stream()
@@ -80,12 +84,10 @@ class Player:
             self._buf.clear()
             self._buffered = 0
         self._had_audio = False
-        # 换设备 = 换了一条声学路径，旧 far 参考全部作废（也把 _emitted 归零，
-        # 新流的帧号从 0 重新计）。
+        # 换设备 = 换了一条声学路径，旧 far 参考全部作废（帧号也从 0 重来）。
         with self._far_lock:
             self._far[:] = 0
-            self._far_total = 0
-        self._emitted = 0
+            self._far_w = 0
         self._open_stream()
         if was_running:
             self._stream.start()
@@ -127,9 +129,10 @@ class Player:
             self._played_audio += filled
             self._buffered -= filled
         self._uptime += frames          # 仅统计用，单写者，不必在锁内
-        # AEC 的 far 读指针基准：**只在这里**推进，代表"真的播出去了多少"。
-        # 单写者（回调）+ CPython 整数读写原子 → 不必加锁（同 _uptime 的理由）。
-        self._emitted += frames
+        # far 参考镜像：**看 `outdata` 本身** —— 它就是真正送去扬声器的 PCM
+        # （缓冲空时填的静音也在里面）。写索引在数据写完之后才推进，读侧凭锁看到
+        # 的一定是完整的帧。见 __init__ 里的长注释：这里是"只有一个时钟"的关键。
+        self._mirror_far(outdata[:, 0])
 
     # ---- 生命周期 ----
     def start(self):
@@ -156,48 +159,49 @@ class Player:
             buf = arr.reshape(-1, self.fmt.channels)
             self._buf.append((buf, tag))
             self._buffered += buf.shape[0]
-        # far 参考镜像：记下"进了播放队列的原始 44.1k 波形"。
-        # ⚠️ 这里**只存不重采样** —— 重采样必须在消费侧做（见 aec.py 的说明）。
-        self._mirror_far(arr)
 
-    def _mirror_far(self, arr: np.ndarray) -> None:
-        """把 44.1k int16 写进环形数组。绝对帧号 f 恒映射到 `f % _far_cap`。"""
-        n = arr.shape[0]
+    def _mirror_far(self, pcm: np.ndarray) -> None:
+        """把**实际送往扬声器的** PCM 写进环形数组。绝对帧号 f 恒映射到 `f % _far_cap`。
+
+        ⚠️ 由音频回调调用（实时线程）—— 只做切片赋值，不分配、不阻塞。
+        注意这里**不重采样** —— 重采样必须在消费侧做（见 aec.py 的说明）。
+        """
+        n = pcm.shape[0]
         if n == 0:
             return
         with self._far_lock:
             if n >= self._far_cap:
-                arr, n = arr[-self._far_cap:], self._far_cap
-            start = self._far_total % self._far_cap
+                pcm, n = pcm[-self._far_cap:], self._far_cap
+            start = self._far_w % self._far_cap
             end = start + n
             if end <= self._far_cap:
-                self._far[start:end] = arr
+                self._far[start:end] = pcm
             else:
                 k = self._far_cap - start
-                self._far[start:] = arr[:k]
-                self._far[:end - self._far_cap] = arr[k:]
-            self._far_total += n
+                self._far[start:] = pcm[:k]
+                self._far[:end - self._far_cap] = pcm[k:]
+            self._far_w += n
 
     def emit_frames(self) -> int:
-        """回调**真正写到输出**的绝对帧数（44.1k）。AEC far 读指针的硬上界。"""
-        return self._emitted
+        """扬声器**累计输出过**的绝对帧数（44.1k）= 当前播放位置。
+
+        AEC far 读指针的基准。单写者（回调）+ CPython 整数读写原子 → 不必加锁
+        （同 `_uptime` 的理由）。
+        """
+        return self._far_w
 
     def far_slice(self, start_frame: int, n_frames: int) -> np.ndarray:
         """取绝对帧区间 [start_frame, start_frame + n_frames) 的 far 参考（44.1k int16）。
 
-        **两个硬边界**：
-          · 不读未来 —— 截到 `emit_frames()`（P-2：未播出的帧不是参考信号）
-          · 不读已滚掉的过去 —— 截到 `_far_total - _far_cap`
+        **唯一的硬边界**：不读已滚掉的过去（截到 `_far_w - _far_cap`）。
+        这里**没有"不读未来"这一条** —— 镜像里的每一帧都已经被扬声器播出去了
+        （回调写的），所以镜像帧号 ≡ 播放位置 ≡ `_far_w`，三者同一个时钟。
         返回**实际可用**的部分（可能短于请求，也可能为空）。读指针只增不减。
-
-        ⚠️ 边界计算必须在 `_far_lock` **内**做完：`_far_total` 会在锁外被写线程推进，
-        锁外算出的 `lo` 可能已落在被新数据覆盖的位置上 → 返回一份新旧混着的参考。
-        （`_emitted` 只有回调写，且恒 <= `_far_total`，锁外读是安全的。）
         """
         with self._far_lock:
-            total = self._far_total
+            total = self._far_w
             lo = max(0, int(start_frame), total - self._far_cap)
-            hi = min(int(start_frame) + max(0, int(n_frames)), total, self._emitted)
+            hi = min(int(start_frame) + max(0, int(n_frames)), total)
             if hi <= lo:
                 return np.zeros(0, dtype=np.int16)
             return self._far[np.arange(lo, hi) % self._far_cap].copy()

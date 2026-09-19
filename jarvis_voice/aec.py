@@ -43,7 +43,7 @@ class AecGate:
             stream_delay_ms=cfg.aec_stream_delay_ms,
         )
         self._delay_frames = int(cfg.aec_stream_delay_ms / 1000.0 * 44100)
-        self._far_read: int | None = None    # 44.1k 绝对帧读指针，**只增不减**
+        self._far_read = 0                   # 最近一次用的 far 读位置（仅用于观测）
         self.fed = 0                         # 喂进去的近端样本数（可观测）
 
     # ---- 主入口 ----
@@ -54,12 +54,19 @@ class AecGate:
             return chunk_f32
         need44 = n16 * DOWN // UP
 
-        if self._far_read is None:
-            # 首帧：以「已播出 - 标称延迟」为起点。这只是个粗对齐 ——
-            # AEC3 是 DelayAgnostic 的，会自估真实延迟（实测 0 与 100ms 无差别）。
-            self._far_read = max(0, self.player.emit_frames() - self._delay_frames)
+        # far 读位置**锚定在播放时钟上**（`emit_frames`），不自由推进。
+        #
+        # ⚠️ 一开始写的是自由推进（每次 `_far_read += need44`），那是错的：
+        #    它默认了 accept() 一定按实时速率被调用。一旦主循环赶工、或麦克风队列
+        #    积压后一次性排空，读指针就会**跑到播放位置之前** → `far_slice` 长期
+        #    返回空 → AEC 参考全零 → 什么都不消。是"两个时钟"那类 bug 的反方向。
+        #    锚定之后最坏只是**瞬时**偏移（AEC3 的 delay estimator 能吸收），
+        #    不会长期失准。
+        # 稳态下两者等价：近端每 100ms 一块 → 播放也正好推进 4410 帧。
+        target = max(0, self.player.emit_frames() - self._delay_frames)
+        self._far_read = target
 
-        far44 = self.player.far_slice(self._far_read, need44)
+        far44 = self.player.far_slice(target, need44)
         # 启动瞬间/被环覆盖时可能短 → 前面补零（补零 = 参考"当时是静音"，比错位安全）
         if far44.shape[0] < need44:
             far44 = np.concatenate(
@@ -90,6 +97,6 @@ class AecGate:
             return 0.0
 
     def reset(self):
-        """切模式 / 换设备时调 —— AEC 内部状态与 far 读指针都要重来。"""
+        """切模式 / 换设备时调 —— AEC 内部状态重来（读指针每次都是从播放时钟算的）。"""
         self.ap.reset()
-        self._far_read = None
+        self._far_read = 0
