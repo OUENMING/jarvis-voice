@@ -57,7 +57,7 @@ SYSTEM_PROMPT = (
     "    '开个新窗口''打开…''看看这个网页'时，用浏览器工具做，做完用一句话回报结果。"
 )
 
-# 第二大脑（Obsidian）热重连。server 名须与 mcp-jarvis.json 里的 **完全一致**。
+# 第二大脑（Obsidian）热重连。server 名须与 mcp-jarvis.local.json 里的 **完全一致**。
 MEMORY_SERVER = "obsidian-vault"
 OBSIDIAN_PORT = 27124
 
