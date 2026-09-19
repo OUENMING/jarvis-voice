@@ -280,15 +280,31 @@ class AecGate:
 
 ## 6. 派单方式（给 ZCode）
 
+**控制面实测结论（2026-09-19，ZCode CLI 0.16.5）：**
+
+| 参数 | 声称 | 实测 |
+|---|---|---|
+| `--allowed-tools` / `--disallowed-tools` / `--disallowedTools` / `--allowedTools` | 工具白黑名单 | ❌ **四种写法全被解析器拒**（`Unknown option`）——帮助里有、实际不认。**唯一的逐工具护栏是死的** |
+| `--mode plan` | 只读 | ✅ 真的拦住写入（要它建文件，它只列计划） |
+| `--mode build` | — | ⚠️ **headless 下卡死**（等一个没人能批的审批，9 分钟零产出） |
+| `--mode yolo` | 默认 | ✅ 唯一能真跑的模式 |
+
+→ **真正有效的沙箱只有 `--mode` + `--cwd` 两层。**
+
 ```bash
-# ⚠️ 前置：G-1/G-2 已清；仓库已在 git 下
-zcode -p "$(cat WO-AEC-01.md) 请按 §2 逐文件实施。" \
+cd ~/jarvis-voice
+git rev-parse HEAD                     # ← 先记下回滚点
+zcode -p "读 docs/WORKORDER-AEC-01.md，按 §2 逐文件实施。只改 §2 列出的文件，不要动其他文件。完成后报告改了哪些文件、每个文件的关键改动。" \
   --cwd ~/jarvis-voice \
-  --mode edit \
-  --json
+  --mode yolo \
+  --json --no-color
 ```
 
-**不要用 `--mode yolo`。不要用 `--allowed-tools`（实测坏的，会直接报错退出）。**
+**只读/复核类任务改用 `--mode plan`**（它不会动手，会先出计划——所以要它真跑计算时得用 yolo）。
 
-**派完后 Claude 必做**：`git diff` 逐行复核 + 跑 §2.1/§2.2 的验收断言。
-**不通过就不合并** —— 对外部模型的 diff 用与子代理引用相同的标准（「子代理给的引用经常是错的」）。
+**派完后 Claude 必做**：
+1. `git diff` **逐行**复核（不是看摘要）
+2. 跑 §2.1 / §2.2 的验收断言
+3. **不通过就 `git checkout .` 回滚，不合并**
+
+对外部模型的 diff，用与子代理引用相同的标准 —— **「子代理给的引用经常是错的」，外部模型的 diff 同理。**
