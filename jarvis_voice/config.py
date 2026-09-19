@@ -167,6 +167,14 @@ class Config:
     fish_model: str = "s2.1-pro-free"
     fish_sample_rate: int = 44100    # 实测 Fish PCM = 44100Hz/单声道/int16
     fish_latency: str = "balanced"   # balanced 比 normal 更快（实测）
+    # ⚠️ 实测（2026-09-19，n=20 交替测排除时段漂移）：**REST 比 WebSocket 快 3.26 倍**
+    #   WS   p50=1559ms  p90=1835ms
+    #   REST p50= 478ms  p90= 733ms
+    # 同一个模型、同一个音色、同一个 key —— **只换传输方式，不动音质**。
+    # 所以默认关掉 WS。（`latency` 在兼容 API 上可能被忽略，但两条路都是 balanced，
+    # 差别来自传输本身。）
+    # 想回 WS：`FISH_WS=1`
+    fish_use_websocket: bool = False
     fish_temperature: float = 0.3    # 实测：0.7 时同句时长变异 7.6%，0.1 时降到 2.1%。助手要稳定
 
     # ---- 兜底 ----
@@ -224,6 +232,7 @@ class Config:
             tts_provider=_env_str("JARVIS_TTS", cls.tts_provider),            fish_voice=_env_str("FISH_VOICE", cls.fish_voice),
             fish_model=_env_str("FISH_MODEL", cls.fish_model),
             fish_latency=_env_str("FISH_LATENCY", cls.fish_latency),
+            fish_use_websocket=os.environ.get("FISH_WS", "0") == "1",
             fish_temperature=_env_float("FISH_TEMPERATURE", cls.fish_temperature),
             say_voice=_env_str("JARVIS_SAY_VOICE", "Tingting"),
         )

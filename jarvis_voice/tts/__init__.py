@@ -16,6 +16,7 @@ def make_tts(cfg: Config) -> TTSBackend:
     if provider == "fish":
         return FishTTS(voice_id=cfg.fish_voice, model=cfg.fish_model,
                        sample_rate=cfg.fish_sample_rate, latency=cfg.fish_latency,
+                       use_websocket=cfg.fish_use_websocket,
                        temperature=cfg.fish_temperature)
     if provider == "say":
         return SayTTS(voice=cfg.say_voice)
