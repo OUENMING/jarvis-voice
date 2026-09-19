@@ -76,7 +76,25 @@ class FishTTS:
             if r.status_code != 200:
                 detail = r.read()[:200].decode("utf-8", "replace")
                 raise TTSError(f"Fish REST {r.status_code}: {detail}")
-            yield from r.iter_bytes()
+            # ⚠️ REST 的块长度**任意**（实测 76/81 是奇数，如 1363/1369 字节），
+            # 而我们的格式是 int16 = 每样本 2 字节。直接 `np.frombuffer` 会抛
+            # `ValueError: buffer size must be a multiple of element size`，
+            # **整句哑掉**（真机踩到：填充音能响、正文全静音 —— 因为填充音是
+            # 预渲染 WAV，块长恒定；正文走这条路）。
+            # WS 路的块是 40960 字节（偶数）所以一直没暴露。
+            #
+            # ⚠️ 不能简单丢弃余字节 —— 那会让**后续所有样本错位半个**（噪音）。
+            # 必须**跨块携带**：把上一块多出来的那个字节拼到下一块前面。
+            carry = b""
+            for chunk in r.iter_bytes():
+                buf = carry + chunk
+                even = len(buf) - (len(buf) % 2)
+                if even:
+                    yield buf[:even]
+                carry = buf[even:]
+            # 流结束时可能剩半个样本 —— 丢掉（不足一个样本，听不出来）
+            if carry:
+                print(f"[tts] REST 流尾剩 {len(carry)} 字节（半个样本），已丢弃", flush=True)
 
     # ---------- WebSocket 流式（默认，更快） ----------
     def _synthesize_ws(self, texts: Iterable[str]) -> Iterator[bytes]:

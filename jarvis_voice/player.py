@@ -151,6 +151,16 @@ class Player:
         """tag 用于事后按来源剪切（如把还在排队的填充音切掉）。"""
         if not pcm:
             return
+        # ⚠️ int16 = 每样本 2 字节，块长必须是偶数。
+        # 真机踩到（2026-09-19）：Fish 改走 REST 后块长变成**任意**（76/81 是奇数），
+        # `np.frombuffer` 抛 ValueError，被 `_tts_loop` 的异常护栏吞掉 →
+        # **正文全静音，而填充音照响**（填充音是预渲染 WAV，块长恒定）——
+        # 现象极具误导性，查了很久。这里显式拦住并给出可诊断的信息，
+        # 别再让它以一个看不懂的 numpy 报错消失在日志里。
+        if len(pcm) % 2:
+            raise ValueError(
+                f"Player.write 收到奇数长度 {len(pcm)} 字节（int16 须为偶数）—— "
+                f"上游 TTS 没有按样本对齐。看 tts/fish.py 的块切分。")
         arr = np.frombuffer(pcm, dtype=np.int16)
         rem = arr.shape[0] % self.fmt.channels
         if rem:
