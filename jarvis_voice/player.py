@@ -37,6 +37,9 @@ class Player:
         self._played_audio = 0    # **实际输出过音频**的帧数 ← 本轮播到第几秒
         self._underruns = 0       # 只在"播过音频之后又断供"时计数（真卡顿）
         self._had_audio = False
+        # 暂停（**保留缓冲**，与销毁性的 `flush()` 相对）。
+        # 用途：barge-in 先暂停、在宽限窗口内判断用户是真打断还是只在 backchannel。
+        self._paused = False
         # 缓冲里现有帧数。维护成计数器而不是每次遍历 deque：
         # `buffered_seconds()` 每 20ms 被调一次，全量遍历会与**实时音频回调**
         # 抢同一把锁，长回答时可能 xrun/爆音（审计发现）。
@@ -118,7 +121,8 @@ class Player:
     def _cb(self, outdata, frames, time_info, status):
         filled = 0
         with self._lock:
-            while filled < frames and self._buf:
+            paused = self._paused
+            while (not paused) and filled < frames and self._buf:
                 chunk, tag = self._buf[0]         # 形状 (N, channels)
                 n = chunk.shape[0]
                 need = frames - filled
@@ -133,8 +137,10 @@ class Player:
                     self._buf[0] = (chunk[need:], tag)
                     filled += need
             if filled < frames:
-                outdata[filled:, 0] = 0              # 缓冲空 → 静音
-                if self._had_audio:                  # 只在"播过之后又断供"才算卡顿
+                outdata[filled:, 0] = 0              # 缓冲空（或暂停）→ 静音
+                # ⚠️ **暂停不算卡顿**：暂停是我们自己叫停的，缓冲里还有数据。
+                # 不加这个判断的话，每次 barge-in 都会记一次假的 underrun。
+                if self._had_audio and not paused:
                     self._underruns += 1
                     self._had_audio = False
             else:
@@ -150,6 +156,7 @@ class Player:
         # far 参考镜像：**看 `outdata` 本身** —— 它就是真正送去扬声器的 PCM
         # （缓冲空时填的静音也在里面）。写索引在数据写完之后才推进，读侧凭锁看到
         # 的一定是完整的帧。见 __init__ 里的长注释：这里是"只有一个时钟"的关键。
+        # 暂停时镜像到的自然是静音 —— 与"扬声器此刻确实没出声"一致，AEC 参考是对的。
         self._mirror_far(outdata[:, 0])
 
     # ---- 生命周期 ----
@@ -282,8 +289,29 @@ class Player:
         with self._lock:
             self._buf.clear()
             self._buffered = 0
+            self._paused = False          # 缓冲都没了，暂停也没意义
         self._had_audio = False
         return played
+
+    def pause(self) -> None:
+        """暂停播放 —— **保留缓冲**（这是它与 `flush()` 的唯一区别）。
+
+        为什么要"暂停"而不是"清空"：barge-in 那一刻还不知道用户是**真要打断**
+        还是只是应了一声「嗯」。清空就再也接不回去了（CC 那一轮也被作废），
+        而暂停可以在确认是误判后**原样接着播**。
+        """
+        with self._lock:
+            self._paused = True
+
+    def resume(self) -> None:
+        """撤销 `pause()`，从暂停处继续播。"""
+        with self._lock:
+            self._paused = False
+
+    @property
+    def is_paused(self) -> bool:
+        with self._lock:
+            return self._paused
 
     def played_seconds(self) -> float:
         """**本轮**已播音频秒数（OpenAI `audio_end_ms` 的对应物）。"""

@@ -82,7 +82,7 @@ LiveKit Agents framework**」。要它就得整栈换 LiveKit Agents。**是许�
 
 ---
 
-### 🥇 P1 —— 打断误判恢复（false-interruption recovery）
+### ✅ P1 —— 打断误判恢复（**本轮已完成**）
 
 **问题**（🟢 本轮核实）：`filler.py` 的 docstring 写着用途是
 「**不要因为一句"嗯""对"就打断正在播报的助手**」，
@@ -91,24 +91,37 @@ LiveKit Agents framework**」。要它就得整栈换 LiveKit Agents。**是许�
 
 **数据**：41 次早打断（<3 秒）里大量是 `'嗯。'` `'うん。'` `'.'` `'那个。'` 这类 —— 用户只是在应答。
 
-**设计**（照抄 LiveKit `false_interruption_timeout` 的语义）：
+**做法**（照抄 LiveKit `false_interruption_timeout` 的语义）：
 
 ```
 VAD 起音 → ① 立即 暂停播放（**保留缓冲**，不销毁）    ← 感知上的即时响应不变
-            ↓ 等转写（~600–800ms 窗口）
-        ② 转写是 backchannel / 空 / 非语音  → **恢复播放**（不重做 CC 那一轮）
+            ↓ 等转写（bargein_grace_ms = 800ms 窗口）
+        ② 转写是 backchannel / 回声 / 空  → **恢复播放**（不重做 CC 那一轮）
         ③ 转写是真心话            → **提交打断**（丢弃缓冲 + 作废轮次 + brain.interrupt）
+        ④ 窗口内没等到任何转写     → 提交（否则会永远卡在暂停）
 ```
 
-**需要的改动**（都不大）：
+**已落地的改动**：
+
 | 文件 | 改动 |
 |---|---|
-| `player.py` | 🆕 `pause()` / `resume()` —— **保留 `_buf`**，回调输出静音。现有 `flush()` 是**销毁**，不能复用 |
-| `orchestrator.py` | `_do_interrupt()` 拆成「暂停」与「提交」两步；主循环在暂停后开一个窗口等转写 |
-| `filler.py` | **扩 `_BACKCHANNEL`**：补 `うん`/`uh-huh` 变体；把「纯标点」「长度 ≤2 且非问句」也算进去（实测 `'.'` 被当成了打断） |
+| `player.py` | 🆕 `pause()` / `resume()` / `is_paused` —— **保留 `_buf`**（`flush()` 是销毁）。回调暂停时输出静音、且**不记 underrun**（那是我们主动叫停的）|
+| `config.py` | 🆕 `bargein_grace_ms: int = 800`（取值依据写在注释里）|
+| `filler.py` | 🆕 `is_false_interruption()` —— **刻意不合并进 `is_backchannel`**（两者契约不同）；`_BACKCHANNEL` 补 `うん/うう/嗯ん` 这些 ASR 错听变体 |
+| `orchestrator.py` | `_do_interrupt` 拆成 `_begin_bargein`（只暂停）/ `_commit_interrupt`（不可逆）；主循环的**自动**打断走宽限、**明说的路径仍是立即提交**；`_brain_once` 在最前面解决待决窗口 |
 
-**验收**：跑一场，在播报中只「嗯」一声 —— **助手不应该停**；说真话时仍应在 400ms 内停。
-**风险**：窗口期内真打断的响应会晚 ~600ms（但音频已经先停了，所以**感知上没变**）。
+**⚠️ 一个连线时容易漏的顺序**：待决窗口必须在 `_brain_once` 的**最前面**解决 ——
+回声护栏 / 停口令 / 元命令那些分支都会 `return`，放在它们之后就**永远不解决**，
+主循环超时一提交，助手还是停了。而最该撤回的那一类（`'那个。'`/`'让我想想。'`）
+恰恰**会被回声护栏拦下** —— 所以回声护栏的结论要**先算出来、传给**这个判断
+（只判一次，否则 `suppressed` 计数还会翻倍）。
+
+**验收**：`tests/test_bargein_recovery.py`（30 条断言，旧行为下 7 条失败 —— red-green 已验证）；
+`test_bargein_latency` **未退化**（暂停是即时的，感知延迟仍是 400ms）。
+
+**🔴 真机未验收**：窗口值 800ms 是按链路时延推的，**没在真机上调过**。
+验收方法：播报中只「嗯」一声 → 助手**不应该停**；说真话 → 仍应在 400ms 内停。
+**代价**：误判撤回时，一句话中间会多一个约 0.8s 的顿 —— 要 A/B 才知值不值。
 
 ---
 

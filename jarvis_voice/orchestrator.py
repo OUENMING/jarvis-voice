@@ -29,7 +29,7 @@ from .config import JARVIS_HOME, Config
 from .commands import match as match_meta
 from .echoguard import EchoGuard, similarity
 from .events import BUS
-from .filler import is_backchannel, is_stop_command
+from .filler import is_backchannel, is_false_interruption, is_stop_command
 from .fillers import TEXTS as FILLER_TEXTS, TOOL_TEXTS, FillerClips, tool_tag
 from .player import Player
 from .sanitize import has_speakable, sanitize_for_speech
@@ -137,6 +137,8 @@ class Orchestrator:
         self._filler_lock = threading.Lock()
         self._hd_gated = False             # 半双工门控：正在因为"自己在播"而不听
         self._last_rejected = 0            # vad.rejected 的上次值（只在变化时上报，见主循环）
+        # 待决的自动打断（VAD 起音已暂停、还在等转写判断）。None = 没有待决的。
+        self._pending_bargein_at: float | None = None
         # 「非应答轮」= CC 自己起的轮次（后台任务跑完后的汇报）。见 docs/WORKORDER-ASYNC-01.md
         self._async_pending: list[str | None] = []   # 攒着的句子；None = 该轮结束哨兵
         self._async_turn: int | None = None          # 我们给自主轮分配的 turn id
@@ -249,6 +251,13 @@ class Orchestrator:
 
     def stop(self):
         self._stop.set()
+        # 退出时把待决的打断清掉并解除暂停：留着的话缓冲排不空，
+        # TTS 那条「等播完再回 IDLE」的收尾循环要一直等到超时才退（虽然有 _stop 兜底）。
+        self._pending_bargein_at = None
+        try:
+            self.player.resume()
+        except Exception:
+            pass
         # ⚠️ 先把未闭合的语音段交出来再收设备：`VadGate.flush()` 此前**无人调用**
         # （审计发现），退出时最后半句会被丢掉。
         try:
@@ -399,8 +408,25 @@ class Orchestrator:
                           and (now - burst_started_at) * 1000 >= self.cfg.interrupt_confirm_ms):
                         self.log(f"⚡ [打断-触发] state={st.value} 爆发已持续 "
                                  f"{(now-burst_started_at)*1000:.0f}ms")
-                        self._do_interrupt()
+                        # ⚠️ 这里是**唯一**走宽限窗口的路径（明说的路径直接提交）：
+                        # 只暂停、不销毁，等转写判断是真打断还是 backchannel。
+                        self._begin_bargein()
                         fired_for_this_speech = True
+                # ---- 待决打断超时 → 提交 ----
+                # 窗口内没等到任何转写（用户一直不出声，或 ASR 没吐出段）→ 当成真打断。
+                # 少了这一步，助手会**永远停在暂停状态**（缓冲还在，但再也不出声）。
+                if (self._pending_bargein_at is not None
+                        and (now - self._pending_bargein_at) * 1000 >= self.cfg.bargein_grace_ms):
+                    if st is State.IDLE:
+                        # 本轮已经自然结束（理论上不该发生：暂停期间缓冲排不空、
+                        # TTS 收尾会一直等 → 状态不会回 IDLE。留作护栏）。
+                        # 这时再提交只会白加一次打断计数 + 给空闲的脑发一帧 interrupt。
+                        self.log("↩️ [打断-撤回] 本轮已自然结束，不需要提交")
+                        self._pending_bargein_at = None
+                        self.player.resume()
+                    else:
+                        self.log(f"⚡ [打断-超时] {self.cfg.bargein_grace_ms}ms 内没有转写 → 提交")
+                        self._commit_interrupt()
                 prev_silence = silence_since if silence_since is not None else prev_silence
         except KeyboardInterrupt:
             self.log("\n[退出]")
@@ -408,13 +434,51 @@ class Orchestrator:
             self.stop()
 
     # ---------- 打断 ----------
+    # ⚠️ 分两步：**暂停**（可撤销）与**提交**（不可撤销）。
+    # 只有「VAD 起音触发的自动打断」走两步 —— 因为那一刻还不知道用户是真打断
+    # 还是只应了一声「嗯」。明说的路径（「停一下」/ 仪表盘按钮 / 清空上下文）
+    # **直接提交**，它们没有歧义。见 docs/PLAN-HUMANNESS-20260920.md P1。
+    def _begin_bargein(self):
+        """VAD 起音 → 先暂停（**保留缓冲**），开一个宽限窗口等转写来判断。"""
+        if self._pending_bargein_at is not None:
+            return                          # 窗口已经开着，别重复开
+        self._pending_bargein_at = time.time()
+        self.player.pause()
+        self.log(f"⚡ [打断-待定] 已暂停，等 {self.cfg.bargein_grace_ms}ms 内的转写判断")
+        BUS.emit("bargein_pending", grace_ms=self.cfg.bargein_grace_ms)
+
+    def _resolve_bargein(self, text: str, is_echo: bool = False):
+        """转写到了（或为空）→ 判定刚才是误判还是真打断。**没有待决窗口时是 no-op。**
+
+        `is_echo` 由调用方传进来（回声护栏的结论）—— 是回声同样意味着**误判**，
+        而且那是最常见的一类：`'那个。'` / `'让我想想。'` 是我们自己填充音的回声。
+        """
+        if self._pending_bargein_at is None:
+            return
+        waited = (time.time() - self._pending_bargein_at) * 1000
+        self._pending_bargein_at = None
+        if is_echo or is_false_interruption(text):
+            self.player.resume()
+            why = "回声" if is_echo else "应答词/非语音"
+            self.log(f"↩️ [打断-撤回] {waited:.0f}ms 后判为误判（{why}：{text!r}）→ 接着播")
+            BUS.emit("bargein_reverted", text=text, waited_ms=round(waited),
+                     reason=why)
+            return
+        self.log(f"⚡ [打断-确认] {waited:.0f}ms 后判为真打断（{text[:24]!r}）")
+        self._commit_interrupt()
+
     def _do_interrupt(self):
+        """**立即**打断（无宽限）。明说的路径与仪表盘按钮用这个。"""
+        self._pending_bargein_at = None
+        self._commit_interrupt()
+
+    def _commit_interrupt(self):
         self._cancel_filler()
         # ⚠️ 顺序要紧：**先作废轮次，再清缓冲**。
         # 反过来的话，落在"flush 之后、作废之前"的 TTS 写入不会被再清掉 →
         # 打断后仍会漏播一小段旧句（审计发现）。
         self.session.interrupt()
-        played = self.player.flush()
+        played = self.player.flush()        # flush 会一并清掉 paused 标志
         self.brain.interrupt()
         self._drain(self.sent_q)
         self.log(f"⚡ [打断] 已播 {played:.2f}s | 累计打断 {self.session.interrupts} 次")
@@ -792,19 +856,28 @@ class Orchestrator:
                      f"< asr_min_utt_sec={self.cfg.asr_min_utt_sec}s → 丢弃")
             return
         r = self.asr.transcribe(utt)
-        if not r.text:
-            return
         # ---- 回声文本护栏 ----
         # 内置扬声器场景：AEC 残余越过 VAD 门限被转写。若放它进脑，助手就**回应自己**
         # （HANDOVER §1 的验收口径"不能凭空自言自语"）。放在**最前** ——
         # 是回声的话，不解元命令、不打断、不送 CC。
+        #
+        # ⚠️ 这里**只判一次**，结果同时给下面 `_resolve_bargein` 用：是回声同样意味着
+        # 「这次打断是误判」——`'那个。'` / `'让我想想。'` 就是**我们自己填充音的回声**，
+        # 真机 41 次早打断里出现过。判两次不但多算，还会让 `suppressed` 计数翻倍。
+        hit, score, match = False, 0.0, ""
         if self.cfg.echo_guard_enabled:
-            hit, score, match = self.echo_guard.check(r.text)
-            if hit:
-                self.log(f"[echo] 判为回声（相似度 {score:.2f}）→ 丢弃: {r.text!r}")
-                BUS.emit("echo_suppressed", text=r.text, score=round(score, 3),
-                         match=match[:60], total=self.echo_guard.suppressed)
-                return
+            hit, score, match = self.echo_guard.check(r.text or "")
+        # ⚠️⚠️ **待决的自动打断必须在这条链的最前面解决** —— 后面每个分支都会 `return`，
+        # 放在它们之后的话，被回声护栏拦下的那次转写就**永远不解决**待决窗口 →
+        # 主循环超时提交 → 助手还是停了。
+        self._resolve_bargein(r.text or "", is_echo=hit)
+        if hit:
+            self.log(f"[echo] 判为回声（相似度 {score:.2f}）→ 丢弃: {r.text!r}")
+            BUS.emit("echo_suppressed", text=r.text, score=round(score, 3),
+                     match=match[:60], total=self.echo_guard.suppressed)
+            return
+        if not r.text:
+            return
         busy = self.session.state is not State.IDLE
         if is_stop_command(r.text):
             # ⚠️ 必须**显式打断**，不能只靠主循环那条 300ms 的 VAD 中断计时器——
