@@ -49,6 +49,29 @@ class VadGate:
         self._floor = 0.0
         self._floor_probe = 0      # 初次估计已看了多少块（见 _FLOOR_PROBE_CHUNKS）
         self.rejected = 0          # 被 SNR 门限丢弃的段数（**累计量，reset 不清零**：留着看历史）
+
+        # ---- 预滚缓冲（治「首字被 ASR 判错」，见 config.vad_pre_roll_ms 的注释）----
+        # 实测机制**不是**「话首被切」（能量剖面显示段首就是语音），而是
+        # **ASR 缺前导上下文** —— 补 ~900ms 前导静音后转写从「派放」恢复成「开饭」。
+        # ⚠️ 切片用 `seg.start`，它的坐标系我没彻底定清；但实测在 zh/yue/en 三个文件上
+        #    都不重叠、且恢复正确。若换 ASR/VAD 版本后出现首字重复，先怀疑这里。
+        # ⚠️ **快照时机是关键**：VAD 要等 min_silence_duration 静音之后才吐段，
+        #    所以 `_drain()` 那一刻环里最新的是「尾部静音」，拼上去没用。
+        #    必须在**段刚起**（is_speech_detected False→True）时快照 ——
+        #    那一刻环里最新 N 样本正好是「话首之前」。
+        # ⚠️ 环不能只等于预滚长度：快照是在**检测到语音**那一刻取的，而检测比
+        #    段起点晚约 0.8s（实测）。所以环要留出这段延迟 + 余量，才能在发段时
+        #    切出「段起点之前的 N 毫秒」而**不与段本身重叠**（重叠会让 ASR 把
+        #    开头吐两遍：「开饭」→「开放开放」）。
+        self._pre_keep = max(0, int(cfg.vad_pre_roll_ms / 1000.0 * cfg.sample_rate))
+        self._pre_n = self._pre_keep + int(1.2 * cfg.sample_rate) if self._pre_keep else 0
+        self._pre_ring = np.zeros(self._pre_n, dtype=np.float32) if self._pre_n else None
+        self._pre_w = 0            # 环形写指针
+        self._pre_filled = 0       # 已写入样本数（< _pre_n 表示还没填满）
+        self._fed_total = 0        # 已喂给 VAD 的样本总数（与 sherpa 的 seg.start 同一坐标）
+        self._pre_snap: np.ndarray | None = None   # 段起那一刻的环快照
+        self._pre_snap_fed = 0     # 取快照时的 _fed_total
+        self._was_speaking = False
         # ⚠️ sherpa 的 VAD **不是线程安全的**。仪表盘的"恢复监听"会从 uvicorn 线程
         # 调 reset()，而主线程同时在 accept_waveform —— 并发会让内部状态损坏，
         # 表现为"VAD 从此不再出段 = 助手不响应"（异常还会被线程护栏吞掉，极难查）。
@@ -107,18 +130,58 @@ class VadGate:
             self.rejected += 1
         return ok
 
+    # ---- 预滚环形缓冲 ----
+    def _push_pre(self, chunk: np.ndarray):
+        """把这块输入写进预滚环。绝对位置 p 映射到 `p % _pre_n`。"""
+        n = chunk.shape[0]
+        if n == 0:
+            return
+        if n >= self._pre_n:
+            self._pre_ring[:] = chunk[-self._pre_n:]
+            self._pre_w = 0
+        else:
+            end = self._pre_w + n
+            if end <= self._pre_n:
+                self._pre_ring[self._pre_w:end] = chunk
+            else:
+                k = self._pre_n - self._pre_w
+                self._pre_ring[self._pre_w:] = chunk[:k]
+                self._pre_ring[:end - self._pre_n] = chunk[k:]
+            self._pre_w = end % self._pre_n
+        self._pre_filled = min(self._pre_n, self._pre_filled + n)
+
+    def _snapshot_pre(self) -> np.ndarray | None:
+        """取环里**最新**（即刚写进来的）那些样本 —— 段起时刻它就是「话首之前」。"""
+        if not self._pre_n or self._pre_filled == 0:
+            return None
+        n = self._pre_filled
+        idx = (self._pre_w - n + np.arange(n)) % self._pre_n
+        return self._pre_ring[idx].copy()
+
     # ---- 输入 ----
     def accept(self, chunk_f32: np.ndarray) -> list[np.ndarray]:
         """喂一段 float32 [-1,1]。返回**本次新完成**的语音段（int16 一维数组）。"""
         if chunk_f32.dtype != np.float32:
             chunk_f32 = chunk_f32.astype(np.float32)
         with self._lock:                      # 与 reset() 串行化，见 __init__ 注释
+            if self._pre_ring is not None:
+                self._push_pre(chunk_f32)     # 先入预滚环（必须在 VAD 之前）
             self._update_floor(chunk_f32)
             self._buf = np.concatenate([self._buf, chunk_f32]) if self._buf.size else chunk_f32
             done: list[np.ndarray] = []
             while self._buf.size >= self.win:
                 frame, self._buf = self._buf[:self.win], self._buf[self.win:]
                 self.vad.accept_waveform(frame)
+                self._fed_total += frame.shape[0]
+                # ⚠️ **段刚起时快照** —— 不能等 `_drain()` 再取：那时 VAD 已等完
+                #    min_silence_duration，环里最新的是「尾部静音」，拼上去没用。
+                # ⚠️ 直接读 `self.vad.is_speech_detected()`，**不走 property** ——
+                #    那个 property 自己也要拿 `self._lock`，而我们已经持锁 → 死锁。
+                sp = bool(self.vad.is_speech_detected())
+                if sp and not self._was_speaking:
+                    self._pre_snap = self._snapshot_pre()
+                    self._pre_snap_fed = self._fed_total
+                self._was_speaking = sp
                 done.extend(self._drain())
             return done
 
@@ -136,7 +199,23 @@ class VadGate:
             # pop() 之后它即失效，samples 读出来是空列表 → 语音段被静默丢弃（实测踩过）。
             pcm = np.asarray(seg.samples, dtype=np.float32)
             self.vad.pop()
+            # ⚠️⚠️ **门限必须在拼预滚之前判**（RESEARCH-UPGRADE-PLAN §2.3 的陷阱）：
+            # 预滚是语音**之前**的静音，会**稀释整段 RMS** → 先拼再判会让段落掉到
+            # `floor*snr` 以下 → 被丢弃 = 「加了 padding 反而更常丢话」的反直觉回归。
+            # 强制顺序：sherpa 出段 → ① 在**未 padding 的原始段**上判门限
+            #                     → ② 通过了才拼预滚 → ③ 送 ASR
             if pcm.size and self._passes_gate(pcm):
+                snap, snap_fed = self._pre_snap, self._pre_snap_fed
+                self._pre_snap = None          # 用完即清：下一段会在段起时重新快照
+                if snap is not None and snap.size and self._pre_keep:
+                    # 快照末尾（= snap_fed）到段起点（seg.start）的距离
+                    off = snap_fed - int(getattr(seg, "start", 0) or 0)
+                    hi = snap.shape[0] - off
+                    lo = hi - self._pre_keep
+                    if lo >= 0 and hi > lo:
+                        # 只拼**段起点之前**的那一段 —— 拼多了会和段本身重叠，
+                        # ASR 会把开头吐两遍（实测「开饭」→「开放开放」）。
+                        pcm = np.concatenate([snap[lo:hi], pcm])
                 out.append(np.clip(pcm * 32767.0, -32768, 32767).astype(np.int16))
         return out
 
@@ -165,3 +244,12 @@ class VadGate:
             self._buf = np.zeros(0, dtype=np.float32)
             self._floor = 0.0                 # 哨兵：让它按新会话重新估计
             self._floor_probe = 0
+            # 预滚环必须一起清 —— 否则上一轮的音频会被当成本轮的「话首之前」拼上去
+            if self._pre_ring is not None:
+                self._pre_ring[:] = 0
+            self._pre_w = 0
+            self._pre_filled = 0
+            self._pre_snap = None
+            self._pre_snap_fed = 0
+            self._fed_total = 0
+            self._was_speaking = False

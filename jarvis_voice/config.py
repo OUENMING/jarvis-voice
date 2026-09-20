@@ -54,6 +54,21 @@ class Config:
     # 文本层无法过滤，只能在音频层拦。
     vad_min_snr: float = 3.0         # 段 RMS 至少是噪声底的 3 倍（≈9.5dB）
     vad_min_rms: float = 0.012       # 绝对下限，防噪声底被估得过低
+    # ---- 预滚缓冲（治「首字被 ASR 判错」）----
+    # 现象（真机）：短命令的首字被毁 ——「清空上下文」→「轻松/星空/供」。
+    # 离线复现（zh.wav，完全可重复）：只喂 VAD 段 →「**派放**时间早上9点至下午5点。」
+    #                                完整语音    →「**开饭**时间早上9点至下午5点。」
+    #
+    # ⚠️ **机制与最初的假设不同，以实测为准**：段本身**没有被切头** ——
+    # 能量剖面显示段首就是语音（每100ms RMS [8092, 7158, …]）。缺的是
+    # **ASR 的前导上下文**：SenseVoice 从半路开始听就会把首字判错。
+    # 拼上预滚后剖面变成 [0, 104, …, 13, 10, 778, 8092] —— 多出 ~800ms 前导静音，
+    # 转写随即恢复成完整的「开饭」。
+    #
+    # 取值依据（离线扫，ASR 已验证确定性 3/3 相同）：
+    #   600/700ms → 「开放」（只救回一半）    800/900/1000ms → 「开饭」✅
+    # 取 900ms 落在有效带中间。
+    vad_pre_roll_ms: int = 900
 
     # ---- ASR ----
     asr_provider: str = "sensevoice"  # sensevoice（本地免费）| fish（云，$0.36/时，需 API credit）
@@ -250,6 +265,7 @@ class Config:
             vad_min_silence=_env_float("JARVIS_VAD_MIN_SILENCE", 0.5),
             vad_min_snr=_env_float("JARVIS_VAD_MIN_SNR", cls.vad_min_snr),
             vad_min_rms=_env_float("JARVIS_VAD_MIN_RMS", cls.vad_min_rms),
+            vad_pre_roll_ms=_env_int("JARVIS_VAD_PRE_ROLL_MS", cls.vad_pre_roll_ms),
             # 回声护栏：阈值要能从事件日志调（看 echo_suppressed 的 score 分布）
             echo_guard_enabled=os.environ.get("JARVIS_ECHO_GUARD", "1") == "1",
             echo_guard_threshold=_env_float("JARVIS_ECHO_GUARD_THRESHOLD", cls.echo_guard_threshold),

@@ -78,6 +78,51 @@ g4._update_floor(const(0.15))
 # 静音块（全零）rms=0 → 仍应被拦（0 >= 3e-6 为假）
 check("vad_min_rms=0 时全零段仍被拦", bool(g4._passes_gate(np.zeros(1600, np.float32))), False)
 
+# ════════════════════════════════════════════════════════════════════
+# 预滚缓冲（治「话首被切」）—— 见 config.vad_pre_roll_ms 的注释
+# ════════════════════════════════════════════════════════════════════
+print()
+print("  ── 预滚缓冲 ──")
+import wave, dataclasses, glob  # noqa: E402
+import sherpa_onnx  # noqa: E402
+
+SENSE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                     "models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/test_wavs")
+
+
+def segment_of(cfgx, path):
+    with wave.open(path, "rb") as w:
+        a = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32)
+    a = a / 32768.0
+    g = VadGate(cfgx)
+    stream = np.concatenate([np.zeros(16000, np.float32), a, np.zeros(16000, np.float32)])
+    out = []
+    for i in range(0, len(stream), 1600):
+        out.extend(g.accept(stream[i:i + 1600]))
+    out.extend(g.flush())
+    return out[0] if out else None
+
+
+if os.path.isdir(SENSE):
+    zh = os.path.join(SENSE, "zh.wav")
+    if os.path.exists(zh):
+        c0 = dataclasses.replace(cfg, vad_pre_roll_ms=0)
+        c9 = dataclasses.replace(cfg, vad_pre_roll_ms=900)
+        s0, s9 = segment_of(c0, zh), segment_of(c9, zh)
+        check("预滚开关都能出段", bool(s0 is not None and s9 is not None), True)
+        if s0 is not None and s9 is not None:
+            d = (len(s9) - len(s0)) / 16000
+            # 预滚只该**补上缺的头**，不该把同一段音频拼两遍 → 增量必须 ≈ 预滚量，不能翻倍
+            check(f"预滚 900ms 的净增 ≈0.9s（实测 {d:.2f}s，翻倍=重叠）", 0.7 <= d <= 1.0, True)
+            # ⚠️ 实测剖面（见 config.vad_pre_roll_ms 注释）：预滚拼进去的**是静音**，
+            #    段本身并没有被切头 —— 缺的是 ASR 的**前导上下文**。
+            a9, a0 = s9.astype(np.float64), s0.astype(np.float64)
+            lead = float(np.sqrt(np.mean(a9[:8000] ** 2)))        # 前 0.5s
+            body = float(np.sqrt(np.mean(a9[8000:16000] ** 2)))   # 之后 0.5s
+            check(f"预滚拼的是前导静音（前0.5s RMS={lead:.0f} < 后半 {body:.0f}）",
+                  lead < body * 0.5, True)
+            check("预滚后整段更长（净增 ≈ 预滚量）",
+                  len(s9) > len(s0), True)
 print()
 if FAIL:
     print(f"❌ 失败 {len(FAIL)} 项: {FAIL}")
