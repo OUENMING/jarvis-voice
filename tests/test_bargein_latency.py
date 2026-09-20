@@ -7,18 +7,31 @@
 
 离线量化（本文件就是在锁这个数）：
   感知延迟 = 语音起点 → `vad.speaking` 翻 True → `interrupt_confirm_ms` 确认窗
-  旧配置（confirm=300）→ **600ms**
-  新配置（confirm=100）→ **400ms**
+  旧配置（confirm=300，min_speech=0.25）→ **600ms**
+  上一版（confirm=100，min_speech=0.25）→ **400ms**
+  🔴 **2026-09-20 深夜：把 min_speech 压到 0.05 试过（延迟确实 200ms），
+     但真机立刻出回归 ——「每次开播都被自己的声音打断」。已回退到 0.25。**
+
+  ⚠️⚠️ **这个测试没能预测那次回归，也没能复现它 —— 别把它当"改了这里安全"的依据。**
+     事后查证：下面 [2] 那组用的是**白噪声**，而真机里的漏回是**助手的语音**。
+     但改用"一小段语音"去复现**也失败了**（120ms 语音在 0.25 下照样触发）。
+     ⇒ **最小复现至今没找到，真因未知。**
+     ⇒ **结论：涉及实时交互的参数，离线测试通过 ≠ 真机不会坏。必须真机先验。**
 
 判据来源（全部离线，不开任何音频设备 —— 见全局记忆
 `audio-probe-device-contention`）：
-  1. `is_speech_detected()` **本身就要等 `vad_min_speech`(0.25s) 连续语音**
+  1. `is_speech_detected()` **本身就要等 `vad_min_speech` 连续语音**
      （实测：min_speech 0.25→+300ms / 0.15→+200ms / 0.05→+100ms）
+     ⇒ 2026-09-20 把 `vad_min_speech` 从 **0.25 压到 0.05**（省 200ms）。
+     安全性依据：下面用例 [2] 的噪声免疫 + `asr_min_utt_sec`(0.4s) 兜短段 +
+     打断误判有 `bargein_grace_ms` 撤回窗
      → 那一层确认**已经存在**，`interrupt_confirm_ms` 是多余的第二次确认。
   2. 它本来要防的瞬态噪声，Silero 自己就拦得住：60–600ms 的宽带噪声爆发
      （30× 噪声底）在任何 min_speech 下**都不会**让 `is_speech_detected()` 翻 True。
 
-⚠️ 用例 1 在旧配置（`interrupt_confirm_ms=300`）下**必须失败**（red-green）。
+⚠️ 用例 1 **对 `interrupt_confirm_ms` 和 `vad_min_speech` 都敏感**：
+   confirm=300 或 min_speech=0.25 时它**必须失败**（red-green，两处都验过）。
+⚠️ 用例 2 是 `vad_min_speech` 能不能压低的**唯一依据** —— 它挂了就说明压过头了。
 """
 import dataclasses
 import os
@@ -37,7 +50,7 @@ from jarvis_voice.vad import VadGate            # noqa: E402
 SR = 16000
 BLOCK = 1600            # = cfg.mic_blocksize，100ms
 ONSET_S = 2.0           # 合成流里语音的真实起点
-LATENCY_BUDGET_MS = 450  # 旧 600 会挂，新 400 会过
+LATENCY_BUDGET_MS = 450  # 实测 400ms（confirm=100, min_speech=0.25）
 
 FAIL = []
 

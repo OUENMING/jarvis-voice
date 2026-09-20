@@ -107,6 +107,25 @@ def _webrtc(delay_ms: int = 0, ns: bool = True, hpf: bool = True) -> Adapter:
                    "生产用的 WebRTC AEC3（自适应滤波 + NLP 残余抑制）")
 
 
+def _wetdry(alpha: float, delay_ms: int = 0) -> Adapter:
+    """**wet/dry 混合**：`alpha·AEC输出 + (1-alpha)·原始麦克风`。
+
+    为什么值得试：Deepgram 官方文档明说「激进的 AEC 抑制会让 barge-in 更难 ——
+    系统会把客户的声音连同回声一起压掉」，推荐**别用 100% AEC 输出、做 wet/dry 混合**。
+    我们的实测（双讲时近端被压 3.19×）正是这个症状，而**这个旋钮我们还没试过**：
+    掺回一点原始音频能减轻近端损伤，代价是漏回一点回声 —— 净收益要实测。
+    """
+    base = _webrtc(delay_ms)
+
+    def run(rec, far):
+        w = base.run(rec, far).astype(np.float64)
+        d = np.asarray(rec, np.float64)
+        return np.clip(alpha * w + (1 - alpha) * d, -32768, 32767).astype(np.int16)
+
+    return Adapter(f"wet{int(alpha * 100)}/dry{int((1 - alpha) * 100)}", run,
+                   "AEC 输出掺回一部分原始音频（Deepgram 推荐的旋钮）")
+
+
 def _pyaec(frame_size: int = 160, filter_length: int = 3200,
            preprocess: bool = False) -> Adapter:
     from pyaec import Aec
@@ -135,8 +154,10 @@ def _pyaec(frame_size: int = 160, filter_length: int = 3200,
 
 def default_adapters() -> list[Adapter]:
     return [
-        Adapter("passthrough", lambda r, f: r, "不过 AEC，作基线/上界"),
+        Adapter("raw(不过AEC)", lambda r, f: r,
+                "原始麦克风：近端完好，但**混着回声**"),
         _webrtc(0),
+        _wetdry(0.7), _wetdry(0.5), _wetdry(0.3),
         _pyaec(filter_length=3200, preprocess=False),
         _pyaec(filter_length=3200, preprocess=True),
         _pyaec(filter_length=6400, preprocess=False),
@@ -364,7 +385,7 @@ def sweep(asr, args) -> int:
     if args.far:
         cases = [(p, args.far) for p in nears] or cases
 
-    total = {a.name: [0, 0] for a in default_adapters() if a.name != "passthrough"}
+    total = {a.name: [0, 0] for a in default_adapters()}   # 含 passthrough=不过 AEC
     per_case = []
     for near_p, far_p in cases:
         near, far = load16(near_p), load16(far_p)
@@ -383,8 +404,6 @@ def sweep(asr, args) -> int:
             line = [f"{os.path.basename(near_p)}/{os.path.basename(far_p)}"
                     f" d={dl} j={jt}"]
             for a in default_adapters():
-                if a.name == "passthrough":
-                    continue
                 txt = asr(a.run(rec_i, far_i)) if asr else ""
                 err = edit_distance(truth, txt)
                 total[a.name][0] += err

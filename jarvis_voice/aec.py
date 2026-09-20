@@ -241,7 +241,18 @@ class AecGate:
         if far44.shape[0] < need44:
             far44 = np.concatenate(
                 [np.zeros(need44 - far44.shape[0], dtype=np.int16), far44])
-        far16 = resample_poly(far44.astype(np.float32), UP, DOWN)
+        # ⚠️⚠️ **必须 `/ INT16` 归一化到 [-1,1]。** `player.far_slice()` 返回的是
+        # **int16 原始 PCM（±32767）**，不是 [-1,1] 的 float。这里漏掉除法的话：
+        #   resample_poly 输出仍是 ±32767 → 下面 `* INT16` 变成 ±1.07e9
+        #   → `np.clip` 全部截到 ±32767 → **far 参考成了方波（只留符号）**
+        # → AEC 拿着一份垃圾参考，什么都消不掉，回声全过 → VAD 听到它自己的声音
+        #   → **「自己打断自己」**。
+        # 真机铁证（2026-09-20 16:1x，`~/.jarvis/bargein-audio/*-far.wav`）：
+        #   RMS 32750 / 32767，**54% 的样本贴在 ±32767** —— 一段正弦输进去也是这样。
+        # ⚠️ **这不是新 bug**：`git show HEAD:jarvis_voice/aec.py` 里就有，
+        # 即**生产 AEC 从上线起就没拿到过可用参考**。之前的 34–36 dB ERLE 全是
+        # 独立探针(`tests/aec_probe.py`)自己造参考测的，**没走过这条路径**。
+        far16 = resample_poly(far44.astype(np.float32) / INT16, UP, DOWN)
         # 长度对齐到近端（整除时精确相等；不整除时裁/补）
         if far16.shape[0] < n16:
             far16 = np.concatenate([far16, np.zeros(n16 - far16.shape[0], np.float32)])

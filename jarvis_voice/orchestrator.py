@@ -45,12 +45,36 @@ from .vad import VadGate
 BARGEIN_UTT_WINDOW_S = 30.0
 
 # 口语化强约束 system prompt —— 实测有效（docs/RESEARCH-NATURALNESS-20260916.md §6.1）
+#
+# ⚠️ **第 1 条（长度）是这一整段里最要紧的一条**，所以它可切、且按环境变量选：
+#   · 默认（新）：**整轮最多 2 句 / ≤45 字**，然后**问要不要展开**
+#   · `JARVIS_LONG_TURNS=1`（新）：用回旧措辞（「第一句 ≤12 字，再展开」）——
+#     留着是为了**真机 A/B** 与**一键回退**（改动上线前必须能一步退回去）。
+#
+# **为什么要改**：真机日志实测（2026-09-20，43 个回合）——
+#   助手每轮 **中位 110 字 / 6 句**、打断时 `played_s` 中位 **22.4s**（最大 47.2s）。
+#   按中文播音 4.3 字/秒 ≈ **26 秒**。而旧措辞只约束"第一句"，**"再展开"等于发了许可证**
+#   —— 17 条规则里没有一条管**总长**。
+#   行业依据：Google 官方「limit your voice agent to one or two sentences per turn」；
+#   Amazon「一口气测试：要换气就 shorten, or break it into segments」；
+#   CHI 2022 把「整句回复中位 4.03 秒」当作**啰嗦基线**（我们中位是它的 ~6 倍）。
+#   ⚠️ 而且脑是 haiku（小模型）：**规则越多每条越淡**，所以把长度放在**第 1 条**，
+#   而不是追加成第 18 条。
+# 详见 docs/PLAN-SHORT-TURNS-20260920.md
+_RULE_LENGTH = (
+    "1. **整轮最多 2 句（合计 ≤45 字）。** 第一句给答案，第二句**问**要不要展开，"
+    "**不要自己展开**——主人说「展开」「详细说说」你再讲。\n"
+    "   （依据：Google 官方「一句话到两句」；Amazon「一口气测试」。原话讲不完就说明太长了。）\n"
+    if os.environ.get("JARVIS_LONG_TURNS") != "1" else
+    "1. 第一句必须极短（≤12 字），先给结论或应答，再展开。\n"
+)
+
 SYSTEM_PROMPT = (
     "你是 Aries（欧文的私人语音助手）。你说的每句话都会被**逐字朗读**出来，所以必须按口语写。\n"
     "0. **身份**：你的名字叫 **Aries**。**欧文是主人的名字，不是你的**——绝不要说'我是欧文'、\n"
     "   也不要说自己叫欧文。被问'你是谁'就答 Aries。\n"
     "规则：\n"
-    "1. 第一句必须极短（≤12 字），先给结论或应答，再展开。\n"
+    + _RULE_LENGTH +
     "2. 禁止书面语结构：不要'首先/其次/最后/综上所述/值得注意的是/总的来说'。\n"
     "3. 禁止 markdown、列表、编号、括号注释、emoji、代码块。\n"
     "4. 用说话的方式组织：短句、可停顿，必要时用'那个''就是'这类语气词。\n"
@@ -516,6 +540,32 @@ class Orchestrator:
     # 只有「VAD 起音触发的自动打断」走两步 —— 因为那一刻还不知道用户是真打断
     # 还是只应了一声「嗯」。明说的路径（「停一下」/ 仪表盘按钮 / 清空上下文）
     # **直接提交**，它们没有歧义。见 docs/PLAN-HUMANNESS-20260920.md P1。
+    def _bargein_echo_margin(self) -> float | None:
+        """**诊断（当前只报不拦）**：`未过 AEC 的近端 − far`，单位 dB。
+
+        为什么这个数能分辨「自打断」和「人声打断」：真机 11 条捕获实测 ——
+          自打断（麦里只有回声）：**−8.7 ~ −9.4 dB**（用户确认过 2 条）
+          人声打断（用户真在说）：**−1.6 ~ +4.4 dB**
+        中间有 **7.1 dB 的空档**。因果链：助手在播时用户不出声 → 麦里只有回声
+        （比 far 低 8~9 dB）→ AEC 消掉大半后剩 −32~−37 dBFS → **刚好越过 VAD 绝对门限**
+        （`vad_min_rms=0.012=−38.4 dBFS`）→ ASR 在近静音上幻觉出文本 → 当成插话 → **打断自己**。
+
+        ⚠️ **判据用"相对值"（raw 对 far）而不是绝对阈值**：房间、音量、麦距变了会自动跟着变，
+        而且 **far 是我们精确已知的**。详见 docs/PLAN-SHORT-TURNS-20260920.md §0.4/§3。
+        """
+        try:
+            aec = getattr(self, "aec", None)         # 假对象/未建 AEC 时直接跳过
+            if aec is None:
+                return None
+            n = int(0.3 * self.cfg.sample_rate)      # 最近 300ms，与"爆发"尺度相当
+            r, f = aec.raw_slice(n), aec.far_slice(n)
+            if r.size == 0 or f.size == 0:
+                return None
+            rms = lambda x: float(np.sqrt(np.mean((x.astype(np.float64) / 32768.0) ** 2)))
+            return 20 * np.log10(max(rms(r), 1e-12)) - 20 * np.log10(max(rms(f), 1e-12))
+        except Exception:
+            return None                              # 诊断绝不影响主链路
+
     def _begin_bargein(self):
         """VAD 起音 → 先暂停（**保留缓冲**），开一个宽限窗口等转写来判断。"""
         if self._pending_bargein_at is not None:
@@ -523,9 +573,19 @@ class Orchestrator:
         self._pending_bargein_at = time.time()
         self._bargein_utt_at = self._pending_bargein_at   # 诊断用，跨状态重置存活
         self.player.pause()
-        self.log(f"⚡ [打断-待定] 已暂停，等 {self.cfg.bargein_grace_ms}ms 内的转写判断")
-        BUS.emit("bargein_pending", grace_ms=self.cfg.bargein_grace_ms)
-        self.trace.dump("bargein_pending", grace_ms=self.cfg.bargein_grace_ms)
+        # 🆕 **只报不拦**：把"回声余量"记下来，先拿真机数据再决定要不要真的拦。
+        # 阈值 `bargein_echo_margin_db` 只是用来标出"按计划本该拦下的那些"。
+        m = self._bargein_echo_margin()
+        tag = ""
+        if m is not None:
+            tag = f" ｜ 回声余量 {m:+.1f} dB"
+            if m < self.cfg.bargein_echo_margin_db:
+                tag += "  ← ⚠️ 疑似自打断（按计划本该拦）"
+        self.log(f"⚡ [打断-待定] 已暂停，等 {self.cfg.bargein_grace_ms}ms 内的转写判断{tag}")
+        BUS.emit("bargein_pending", grace_ms=self.cfg.bargein_grace_ms,
+                 echo_margin_db=None if m is None else round(m, 2))
+        self.trace.dump("bargein_pending", grace_ms=self.cfg.bargein_grace_ms,
+                        echo_margin_db=None if m is None else round(m, 2))
 
     def _resolve_bargein(self, text: str, is_echo: bool = False):
         """转写到了（或为空）→ 判定刚才是误判还是真打断。**没有待决窗口时是 no-op。**

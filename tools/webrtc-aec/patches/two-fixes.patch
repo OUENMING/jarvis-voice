@@ -1,0 +1,38 @@
+diff --git a/webrtc/api/audio/echo_canceller3_config.h b/webrtc/api/audio/echo_canceller3_config.h
+index 4b1c7fb..c79b82c 100644
+--- a/webrtc/api/audio/echo_canceller3_config.h
++++ b/webrtc/api/audio/echo_canceller3_config.h
+@@ -188,8 +188,14 @@ struct RTC_EXPORT EchoCanceller3Config {
+       float max_dec_factor_lf;
+     };
+ 
++    // ⚠️ 补丁（本地，2026-09-20）：上游 main 有字段试用
++    // `WebRTC-Aec3EnforceMoreTransparentNormalSuppressorHfTuning` 就是把下面这组
++    // 高频阈值从 (.07,.1) 放宽到 (.3,.4)。机制（suppression_gain.cc:202）：
++    //   enr > enr_transparent 才开始压制 → **阈值越高、透明区越大、近端越少被压**。
++    // 默认高频阈值比低频低 4 倍 ⇒ **辅音（全在高频）先被压** —— 与我们实测的症状同型。
++    // 我们的构建（2020 快照）里**没有那个字段试用**，所以直接改默认值。
+     Tuning normal_tuning = Tuning(MaskingThresholds(.3f, .4f, .3f),
+-                                  MaskingThresholds(.07f, .1f, .3f),
++                                  MaskingThresholds(.3f, .4f, .3f),
+                                   2.0f,
+                                   0.25f);
+     Tuning nearend_tuning = Tuning(MaskingThresholds(1.09f, 1.1f, .3f),
+diff --git a/webrtc/modules/audio_processing/audio_processing_impl.cc b/webrtc/modules/audio_processing/audio_processing_impl.cc
+index a1cba51..c5c6dca 100644
+--- a/webrtc/modules/audio_processing/audio_processing_impl.cc
++++ b/webrtc/modules/audio_processing/audio_processing_impl.cc
+@@ -1890,6 +1890,13 @@ void AudioProcessingImpl::InitializeEchoController() {
+       RTC_DCHECK(submodules_.echo_controller);
+     } else {
+       EchoCanceller3Config config;
++      // ⚠️ 补丁（本地，2026-09-20）：AP 层暴露的 `export_linear_aec_output` 从没被
++      // 写进它真正控制的那份 `EchoCanceller3Config`。于是下面的存储被分配了、
++      // AEC3 却不往里写 → 处理时段错误（EXC_BAD_ACCESS @ BlockFramer，空指针）。
++      // 上游 v2.1 的 `AudioProcessing::Config` 不携带 `EchoCanceller3Config`，
++      // 所以没有别的公共途径能设它。这一行把两处接上。
++      config.filter.export_linear_aec_output =
++          config_.echo_canceller.export_linear_aec_output;
+       std::optional<EchoCanceller3Config> multichannel_config;
+       if (use_setup_specific_default_aec3_config_) {
+         multichannel_config = EchoCanceller3::CreateDefaultMultichannelConfig();

@@ -47,7 +47,20 @@ class Config:
     vad_window: int = 512            # silero 512(32ms) / ten-vad 256(16ms)
     vad_threshold: float = 0.6       # 0.5→0.6：瞬态噪声更容易越过低阈值（实测）
     vad_min_silence: float = 0.5     # 判定"说完了"所需的静音时长
-    vad_min_speech: float = 0.25     # ⚠️ 不要调高：0.3s 的"停"也会被丢
+    # ⚠️ **它同时是打断延迟的主要来源**：`is_speech_detected()` 要等这么多秒的
+    # 连续语音才翻 True，而打断就是靠这个翻转发动的。
+    # 实测（`tests/test_bargein_latency.py`，真人语音、静音 2s 后开口）：
+    #     0.25s → **+400ms**   0.10s → +300ms   0.05s → +200ms
+    #
+    # 🔴 **2026-09-20 深夜试过压到 0.05（省 200ms），真机立刻出回归、已回退：**
+    #    「每次开播都被自己的声音打断」—— 因为 **50ms 的门槛挡不住"播放起音那一下
+    #      泄漏的残留回声尾巴"**（AEC 才刚开始适应新 far）。0.25s 的长度刚好能滤掉它。
+    #    ⚠️ 我当时的安全论证漏了这条：测试只覆盖了「短噪声爆发」（Silero 确实拦得住），
+    #      **没覆盖「持续的回声尾巴」**。别再只凭那个测试就给这里放行。
+    # ⇒ **要再快，必须另配「播放起音冷却窗」**（Gemini `prefixPaddingMs` /
+    #    LiveKit `backchannel_boundary` 同款），而不是继续压这个值。
+    # ⚠️ 别调高：0.3s 的「停」也会被丢（旧注释的警告仍然成立）。
+    vad_min_speech: float = 0.25
     vad_max_speech: float = 20.0
     # 段级信噪比门限 —— 对抗"没出声自己说话"的**主防线**。
     # 实测：SenseVoice 对任何非语音都幻觉出文本（静音→'그。'、白噪声→'Yeah.'），
@@ -147,17 +160,18 @@ class Config:
     #   "webrtc" = pywebrtc-audio AEC3：自适应滤波 **＋ NLP 残余抑制**
     #   "speex"  = pyaec/SpeexDSP：**纯线性**分块频域滤波，**不做残余抑制**
     #
-    # **为什么要能切**：真机实测「它一说话我打断，识别就很差」，定案是
-    # **AEC3 在双讲时削掉近端高频**（原始麦克风 4–8k 13–17.5% → 过 AEC 只剩
-    # 0.1–0.3%；见 `docs/ROOTCAUSE-BARGEIN-ASR-20260920.md`）。
-    # 离线拿 20 个合成双讲场景（660 字）比**转写错误率**（`tools/aec_ab.py --sweep`）：
-    #     speex 线性 **8.0%**  vs  webrtc **39.8%**
-    # ⚠️ 合成 ≠ 真机（没有真实房间、没有笔记本麦）⇒ **必须真机再 A/B 一次**才定论。
-    # ⚠️ 顺带否掉一个指标：**近端 SDR 预测不了转写** —— 三种变体的 SDR 几乎相同
-    #    （−0.6/−0.7/−0.1 dB），转写却差 5 倍。别再用它选 AEC，要用真 ASR。
+    # 🟢 **保持 "webrtc"。** 2026-09-20 真机实测（`tools/measure_echo_delay.py`：
+    # 通过生产同一个 Player 放啁啾、同时录，用户不出声 ⇒ 麦克风里只有回声 ⇒
+    # 残差能量是**无歧义**的判据）：
+    #      WebRTC AEC3  消掉 **43.3 dB** ✅
+    #      Speex 线性   消掉 **−0.5 dB**（等于没消）
+    # ⚠️ 曾经基于**合成**场景（纯延迟+增益回声）得到「Speex 8.0% vs WebRTC 39.8%」
+    #    的转写错误率并据此推荐 Speex —— **那条推荐已作废**：真实房间混响下
+    #    Speex 一分贝都消不掉（它的 8kHz 采样率固有缺陷扛不住）。
+    #    **教训：合成基准可以在真实房间上完全翻转，后端选型必须过真机回声。**
     #
-    # 跑真机 A/B：`JARVIS_AEC_BACKEND=speex ./jarvis.sh start --speaker-aec`
-    # （两种后端都会把 `(未过 AEC 的近端, far)` 落盘 → 事后可离线互换复算）
+    # 开关留着不是为了切默认值，是为了**以后做对照实验**：
+    # `JARVIS_AEC_BACKEND=speex ./jarvis.sh start --speaker-aec`
     aec_backend: str = "webrtc"
     # Speex 的回声尾长（样本 @16k）。3200 = 200ms：够覆盖 150ms 物理延迟 + 房间混响。
     # ⚠️ 实测不是越长越好：6400 时转写错误率 11.0%（3200 是 8.0%）—— 抽头多、收敛慢，
@@ -213,11 +227,17 @@ class Config:
     # 而它本来要防的瞬态噪声，Silero 自己就拦得住：离线实测 60/100/150/250/400/600ms
     # 的宽带噪声爆发（30× 噪声底）在 min_speech 取 0.25/0.15/0.05 下**都不翻 True**。
     # 感知延迟：打断 = 语音起点 → VAD 翻 True(~min_speech) → 确认窗。
-    #   300ms → **600ms**（旧，用户反馈"打断还是不灵敏"）
-    #   100ms → **400ms**（新；再往下 50ms 也还是 400ms，被 100ms 块粒度卡住）
-    # 剩下的 250ms 是 `vad_min_speech` 的固有代价：它同时决定"多短的段算话"
-    # （`asr_min_utt_sec` 还会再兜一层），要再快就得动它，另算。
+    #   300ms + min_speech 0.25 → **600ms**（旧，用户反馈"打断还是不灵敏"）
+    #   100ms + min_speech 0.25 → **400ms**（只压确认窗的效果）
+    #   100ms + min_speech **0.05** → **200ms** ← 现在（2026-09-20 再压 VAD 那一层）
+    # 两处都压过了；再往下收益很小（被 100ms 的块粒度卡住）。
     interrupt_confirm_ms: int = 100
+    # 🆕 **自打断判据的阈值（当前只报不拦）**：`未过 AEC 的近端 − far`，低于它就疑似
+    # "麦里只有回声"（=自打断）。真机 11 条捕获实测：自打断 **−8.7 ~ −9.4 dB**、
+    # 人声打断 **−1.6 ~ +4.4 dB**，**中间 7.1 dB 空档**，取中点。
+    # ⚠️ 现在**只用来打日志/标出"本该拦的"**，不影响行为 —— 先真机取一轮数据再决定。
+    # 设成很小的值（如 -99）= 永不标记。见 docs/PLAN-SHORT-TURNS-20260920.md §3。
+    bargein_echo_margin_db: float = -5.0
     # 新爆发前的静音门槛：静得比这短 → 视为"同一次说话的延续"，不武装打断。
     # 治的是 VAD 切分长句时 speaking 的 True→False→True 抖动（真机 4 连自打断）。
     interrupt_min_gap_ms: int = 250
@@ -384,6 +404,17 @@ class Config:
             model, window = MODELS / "vad" / "ten-vad.onnx", 256
         return cls(
             audio_mode=_env_str("JARVIS_AUDIO_MODE", cls.audio_mode),
+            bargein_echo_margin_db=_env_float("JARVIS_BARGEIN_ECHO_MARGIN_DB",
+                                              cls.bargein_echo_margin_db),
+            # ⚠️ 2026-09-21 补：这个一直**只写在文档里、代码从没读过** ——
+            # 文档/计划里说"打断延迟可调"的地方，只有改代码才生效。
+            # 是全仓唯一一个"文档说可设但没接线"的环境变量（有测试守着，见
+            # tests/test_env_wiring.py）。
+            interrupt_confirm_ms=_env_int("JARVIS_INTERRUPT_CONFIRM_MS",
+                                          cls.interrupt_confirm_ms),
+            interrupt_min_gap_ms=_env_int("JARVIS_INTERRUPT_MIN_GAP_MS",
+                                          cls.interrupt_min_gap_ms),
+            bargein_grace_ms=_env_int("JARVIS_BARGEIN_GRACE_MS", cls.bargein_grace_ms),
             # AEC：延迟只给粗值（AEC3 自估）
             aec_stream_delay_ms=_env_int("JARVIS_AEC_DELAY_MS", cls.aec_stream_delay_ms),
             aec_backend=_env_str("JARVIS_AEC_BACKEND", cls.aec_backend),
@@ -406,6 +437,7 @@ class Config:
             vad_window=_env_int("JARVIS_VAD_WINDOW", window),
             vad_threshold=_env_float("JARVIS_VAD_THRESHOLD", 0.6),
             vad_min_silence=_env_float("JARVIS_VAD_MIN_SILENCE", 0.5),
+            vad_min_speech=_env_float("JARVIS_VAD_MIN_SPEECH", cls.vad_min_speech),
             vad_min_snr=_env_float("JARVIS_VAD_MIN_SNR", cls.vad_min_snr),
             vad_min_rms=_env_float("JARVIS_VAD_MIN_RMS", cls.vad_min_rms),
             vad_pre_roll_ms=_env_int("JARVIS_VAD_PRE_ROLL_MS", cls.vad_pre_roll_ms),
