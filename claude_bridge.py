@@ -28,6 +28,7 @@ warm turn ~1-1.5s（对比每轮冷启 claude -p 的 ~1s 进程成本 + 无复�
 """
 import json
 import os
+import queue
 import subprocess
 import threading
 import time
@@ -64,7 +65,7 @@ class ClaudeBridge:
                  allowed_tools: list[str] | None = None, cwd: str | None = None,
                  disallowed_tools: list[str] | None = None,
                  resume: bool = False, system_prompt_file: str | None = None,
-                 bare: bool = True):
+                 bare: bool = True, compact_window: int = 0):
         """`resume=False` 是**刻意的默认**。
 
         ⚠️ 真机踩过：默认开启持久化时，**测试脚本与正式应用共用同一个
@@ -80,6 +81,7 @@ class ClaudeBridge:
         self.disallowed_tools = disallowed_tools or []
         self.resume = resume
         self.bare = bare
+        self.compact_window = compact_window
         self.cwd = cwd or os.getcwd()
         self.proc: subprocess.Popen | None = None
         self.session_id: str | None = None
@@ -95,6 +97,14 @@ class ClaudeBridge:
         self._interrupt_rids: set[str] = set()  # 已发出、待回执的 interrupt request_id
         self._interrupted = False               # 本轮是否已被打断（由回执置位）
         self._turn_open = False                 # 已发消息但还没收到 result
+        # 🆕 「非应答轮」通道（后台工具 / CC 自主续跑）—— 见 docs/WORKORDER-ASYNC-01.md
+        # 为什么需要：CC 在后台任务完成后会**自己起一轮**汇报结果。那一轮的帧如果
+        # 落进 `_pending`，会被下一个 ask() 当成它自己的回答吐出去，且那段的 result
+        # 会把真正的这一轮**提前结束**。所以必须分流。
+        self._awaiting = False                  # 有没有 ask() 正等着 result
+        self._tasks: queue.Queue = queue.Queue()      # task_started/updated/notification/changed
+        self._async_q: queue.Queue = queue.Queue()    # 非应答轮翻译后的事件
+        self._async_buf = ""                          # 非应答轮的切句缓冲
         self._saved_id: str | None = None       # 已落盘的 session_id（避免重复写）
         self._control_lock = threading.Lock()   # 保护 _control
         self._control: dict[str, dict] = {}     # rid → {"ev": Event, "resp": dict}（通用控制帧回执）
@@ -173,6 +183,11 @@ class ClaudeBridge:
         if _mcp and os.path.exists(_mcp):
             cmd += ["--mcp-config", _mcp]
         env = dict(os.environ, MAX_THINKING_TOKENS="0")
+        # ⚠️ 必须显式告诉 CC「窗口有多大」，否则**自动压缩根本不武装**（见 config.py
+        # `brain_compact_window` 的注释：走代理拿不到服务端窗口表 → 来源落到 auto →
+        # 判定函数第一道闸直接 return）。实测证据：项目历史上 250+ 个会话零压缩。
+        if self.compact_window:
+            env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(self.compact_window)
         self.proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, bufsize=1,
@@ -224,19 +239,32 @@ class ClaudeBridge:
         self._saved_id = None
 
     def _pump(self):
-        """唯一的 stdout 读者：解析事件→按类型分发（init 唤醒 ready；control 帧就地处理；其余排队）"""
+        """唯一的 stdout 读者：解析事件→按类型分发（init 唤醒 ready；control 帧就地处理；
+        **任务生命周期**进 `_tasks`；轮内帧按「有没有 ask() 在等」分流）。"""
         for line in self.proc.stdout:
             try:
                 ev = json.loads(line)
             except json.JSONDecodeError:
                 continue
             etype = ev.get("type")
-            if etype == "system" and ev.get("subtype") == "init":
-                self.session_id = ev.get("session_id")
-                self.capabilities = ev.get("capabilities") or []
-                self._save_session()          # 供下次 --resume
-                self._ready.set()
-                continue
+            if etype == "system":
+                sub = ev.get("subtype")
+                if sub == "init":
+                    self.session_id = ev.get("session_id")
+                    self.capabilities = ev.get("capabilities") or []
+                    self._save_session()          # 供下次 --resume
+                    self._ready.set()
+                    continue
+                if sub in ("task_started", "task_updated",
+                           "task_notification", "background_tasks_changed",
+                           # ⚠️ 这两个**必须透出**，不能跟 status 一起丢掉：
+                           #   · `compact_boundary` = 自动压缩**真的发生了** —— 这是
+                           #     「窗口配对了没有」唯一的现场证据（见 config.brain_compact_window）
+                           #   · `api_error` = 上游报错，属于「让失败可见」那一类
+                           "compact_boundary", "api_error"):
+                    self._tasks.put(ev)           # ⚠️ **绝不进 _pending**（见 ASYNC-01 §2）
+                    continue
+                continue                          # status 等：无信息量
             if etype == "control_response":
                 resp = ev.get("response", {})
                 rid = resp.get("request_id")
@@ -251,10 +279,63 @@ class ClaudeBridge:
                         slot["resp"] = resp
                         slot["ev"].set()
                 continue
-            with self._pending_lock:
-                self._pending.append(ev)
+            # 轮内帧：有 ask() 在等 = 应答轮；否则是 **CC 自主续跑**（后台任务汇报）
+            if self._awaiting:
+                with self._pending_lock:
+                    self._pending.append(ev)
+            else:
+                self._absorb_async(ev)
         # stdout EOF = 进程退出
         self._ready.set()
+
+    def _absorb_async(self, ev: dict):
+        """把**非应答轮**的帧翻成事件推进 `_async_q`。
+
+        ⚠️ 刻意**只做「帧 → 句子」**，不复制 `_read_turn` 的排空/中断/超时逻辑 ——
+        那些只对应答轮有意义（应答轮有 ask() 在等、会被 interrupt）。
+        续跑的轮是 CC 自主的，没有超时语义，也不该被当成"上一轮残留"丢弃。
+        """
+        etype = ev.get("type")
+        if etype == "stream_event":
+            se = ev.get("event", {})
+            if se.get("type") == "content_block_delta" and se["delta"].get("type") == "text_delta":
+                self._async_buf += se["delta"].get("text", "")
+                sents, self._async_buf = self._split_sentences(self._async_buf)
+                for s in sents:
+                    self._async_q.put({"type": "sentence", "text": s})
+        elif etype == "assistant":
+            for blk in ev.get("message", {}).get("content", []):
+                if blk.get("type") == "tool_use":
+                    self._async_q.put({"type": "tool", "name": blk.get("name"),
+                                       "input": blk.get("input", {})})
+        elif etype == "result":
+            if self._async_buf.strip():
+                self._async_q.put({"type": "sentence", "text": self._async_buf.strip()})
+            self._async_buf = ""
+            self.session_id = ev.get("session_id") or self.session_id
+            self.total_cost += ev.get("total_cost_usd", 0.0)
+            self._async_q.put({"type": "async_done",
+                               "terminal_reason": ev.get("terminal_reason"),
+                               "is_error": bool(ev.get("is_error"))})
+        # `user` 帧（tool_result 回灌）在续跑轮里没有信息量，忽略
+
+    def next_async(self, timeout: float | None = None) -> dict | None:
+        """取一条**非应答轮**事件。没有则阻塞至多 `timeout` 秒，超时返回 None。
+
+        两类事件混在一条流里（都能出话，顺序即语义）：
+          · `{"type":"sentence"|"tool"|"async_done", ...}` —— CC 自主续跑的内容
+          · `system/task_*` 原帧 —— 后台任务生命周期（`subtype` 区分）
+        """
+        t0 = time.time()
+        while True:
+            for q in (self._tasks, self._async_q):
+                try:
+                    return q.get_nowait()
+                except queue.Empty:
+                    pass
+            if timeout is not None and time.time() - t0 >= timeout:
+                return None
+            time.sleep(0.02)
 
     def stop(self):
         if self.proc:
@@ -411,6 +492,13 @@ class ClaudeBridge:
                 print("[bridge] 进程已死, 重启...", flush=True)
                 self.stop()
                 self.start()
+            # ⚠️⚠️ `_awaiting` 必须在**排空之前**置位，不能等到写 stdin 时才置。
+            # 排空要读的正是「上一轮残留的帧」——若此时 `_awaiting` 还是 False，
+            # `_pump` 会把它们判成**非应答轮**灌进 `_async_q`，于是：
+            #   ① 排空循环永远看不到 result → 白等满 5s 超时
+            #   ② 上一轮的残句/result 被异步线程当成「CC 自主续跑」**念出来**
+            # （ocr 2026-09-20 报的，是引入非应答轮通道时的回归。）
+            self._awaiting = True
             if self._turn_open:
                 # 上一轮被放弃（没等到 result）→ 先排空，否则残留帧会污染本轮
                 print("[bridge] 上一轮未收尾 → 排空残留帧", flush=True)
@@ -437,15 +525,37 @@ class ClaudeBridge:
 
             yield from self._read_turn(timeout)
         finally:
+            self._awaiting = False       # 兜底：生成器被中途丢弃时也要松手
             self._turn_lock.release()
 
     @staticmethod
     def _split_sentences(buf: str):
         """从 buf 切出完整句子。返回 (sentences, rest)。
-        修两个旧缺陷：① 取**最靠前**的句末标点，而非 SENT_END 顺序里第一个出现的；
-                     ② 首句门槛独立（旧版一律 idx<4 导致"好的。"被卡）。"""
+        修三个缺陷：
+          ① 取**最靠前**的句末标点，而非 SENT_END 顺序里第一个出现的；
+          ② 首句门槛独立（旧版一律 idx<4 导致"好的。"被卡）;
+          ③ 🆕 **先剥掉 `buf` 开头的句末标点/空白**（2026-09-20 从真机日志挖出来的）。
+
+        ⚠️⚠️ 缺陷③ 的机制（**这是本文件里最难查的一个**）：
+        消费掉一句之后，`buf` 往往以 `\\n` 开头 —— 模型输出段落之间就是换行。
+        而 `\\n` **在 `SENT_END` 里**，于是 `buf.find('\\n') == 0` →
+        `min(idxs) == 0` → `0 < NEXT_SENT_MIN(4)` → **立刻 break**。
+        `buf` 从此不再缩小，后续每个 delta 都撞同一个 0 → **本轮剩下的内容永远切不开**，
+        最后在 `result` 处被 `if buf.strip(): yield ...` **整块不切**地吐出去。
+
+        真机证据（`~/.jarvis/events.jsonl`，125 轮）：**41 条 >120 字的 `sentence`
+        事件里，41 条全部是每轮的最后一句**，且都含多个「。」与「\n」。
+        这条 bug 会吃掉**每一段带换行的回答**的后半截粒度 —— 首句仍能提前出声
+        （所以 `first_ms` 看起来正常），但**第二句往后要等整段生成完才开始合成**，
+        切句本来就是为了避免这件事。
+        """
         sents = []
+        # ⚠️ 剥离**必须在循环里**做，不能只在进来时做一次：切掉一句之后 buf 又会以
+        # `\n` 开头，第二次迭代照样撞 0。写成循环外的版本时我自己测出来还漏切
+        # （`'…。\n所以…。\n但…。'` 只切出 2 句、剩下 26 字不动）。
         while True:
+            # lstrip 集合 = SENT_END 全部字符 + 空白。开头的句末标点没有内容，剥掉不丢文本。
+            buf = buf.lstrip(ClaudeBridge.SENT_END + " \t")
             idxs = [buf.find(c) for c in ClaudeBridge.SENT_END if c in buf]
             if not idxs:
                 break
@@ -503,6 +613,9 @@ class ClaudeBridge:
                 continue
             elif etype == "result":
                 self._turn_open = False        # 本轮正常收尾
+                # ⚠️ 立刻松手：CC 可能在 result **之后马上**起一轮续跑（后台任务刚完成），
+                # 那些帧必须走 `_absorb_async`，不能留在这里等 ask() 的 finally。
+                self._awaiting = False
                 if buf.strip():
                     yield {"type": "sentence", "text": buf.strip()}
                 self.session_id = ev.get("session_id", self.session_id)

@@ -199,20 +199,28 @@ class VadGate:
             # pop() 之后它即失效，samples 读出来是空列表 → 语音段被静默丢弃（实测踩过）。
             pcm = np.asarray(seg.samples, dtype=np.float32)
             self.vad.pop()
+            # ⚠️⚠️ **快照对「每一个弹出来的段」都要消耗掉**，不能被门限拒绝就留给下一段
+            # （ocr 2026-09-20 报的）。原因：`_pre_snap` 只在「段刚起」那一刻更新，
+            # 而 sherpa 还会因为 `max_speech_duration` **从中间切段**、`is_speech_detected`
+            # 也会抖动 —— 这些段**没有 False→True 跳变**，不会刷新快照，于是会拿到
+            # **上一次快照**，`_pre_snap_fed` 落在本段 `start` 之后 → 把无关音频拼到段首，
+            # 正是注释里警告的「首字吐两遍」。
+            snap, snap_fed = self._pre_snap, self._pre_snap_fed
+            self._pre_snap = None
             # ⚠️⚠️ **门限必须在拼预滚之前判**（RESEARCH-UPGRADE-PLAN §2.3 的陷阱）：
             # 预滚是语音**之前**的静音，会**稀释整段 RMS** → 先拼再判会让段落掉到
             # `floor*snr` 以下 → 被丢弃 = 「加了 padding 反而更常丢话」的反直觉回归。
             # 强制顺序：sherpa 出段 → ① 在**未 padding 的原始段**上判门限
             #                     → ② 通过了才拼预滚 → ③ 送 ASR
             if pcm.size and self._passes_gate(pcm):
-                snap, snap_fed = self._pre_snap, self._pre_snap_fed
-                self._pre_snap = None          # 用完即清：下一段会在段起时重新快照
                 if snap is not None and snap.size and self._pre_keep:
                     # 快照末尾（= snap_fed）到段起点（seg.start）的距离
                     off = snap_fed - int(getattr(seg, "start", 0) or 0)
                     hi = snap.shape[0] - off
                     lo = hi - self._pre_keep
-                    if lo >= 0 and hi > lo:
+                    # ⚠️ 三个边界**都要钳**：Python 的负索引/超界切片**不报错、只绕回**，
+                    # 少了任何一条都会拼进错位的音频而不自知。
+                    if lo >= 0 and hi > lo and hi <= snap.shape[0]:
                         # 只拼**段起点之前**的那一段 —— 拼多了会和段本身重叠，
                         # ASR 会把开头吐两遍（实测「开饭」→「开放开放」）。
                         pcm = np.concatenate([snap[lo:hi], pcm])

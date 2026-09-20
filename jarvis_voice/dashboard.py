@@ -514,12 +514,45 @@ def events():
                                       "X-Accel-Buffering": "no"})
 
 
+_server = None       # uvicorn.Server 句柄，供 shutdown()/wait_ready() 用
+
+
 def serve(host: str = "127.0.0.1", port: int = 8848):
+    """阻塞式跑仪表盘（调用方放线程里）。
+
+    ⚠️ **不再在 `run()` 之前就宣告"已启动"**（ocr 2026-09-20 报的）：
+    原写法先 `print("[仪表盘] http://…")` 再 `uvicorn.run(...)`，于是**端口被占**时
+    uvicorn 在线程里抛异常、异常没人看见，而用户已经看到那句"http://…"——
+    以为仪表盘好了，实际什么都没有。现在改成拿 `Server` 句柄，由调用方
+    `wait_ready()` 确认真起来了再宣告。
+    """
+    global _server
     import uvicorn
     # ⚠️ 强制只绑本地：本项目被开放端口咬过（8006/22400 至今可达）
     assert host in ("127.0.0.1", "localhost"), "仪表盘只允许绑定本地回环"
-    print(f"[仪表盘] http://{host}:{port}  （仅本机可访问）", flush=True)
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    _server = uvicorn.Server(uvicorn.Config(app, host=host, port=port,
+                                            log_level="warning"))
+    _server.run()
+
+
+def wait_ready(timeout: float = 5.0) -> bool:
+    """等仪表盘**真的**起来。返回是否成功（超时/已退出 = False）。"""
+    import time
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if _server is not None:
+            if getattr(_server, "started", False):
+                return True
+            if getattr(_server, "should_exit", False):
+                return False
+        time.sleep(0.05)
+    return False
+
+
+def shutdown():
+    """请求 uvicorn 退出（`__main__` 收尾时调）。"""
+    if _server is not None:
+        _server.should_exit = True
 
 
 if __name__ == "__main__":

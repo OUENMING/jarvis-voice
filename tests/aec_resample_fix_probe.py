@@ -82,6 +82,10 @@ def erle(near, ref16, skip_s=1.5):
 
 def main():
     x16 = load16(f"{SENSE}/test_wavs/zh.wav")
+    # ⚠️ 空数组会让下面 `concatenate([x16, x16])` 永远是空的 → **死循环空转占满 CPU**
+    # （ocr 2026-09-20 报的）。wav 读失败/重采样结果为空都会走到这里。
+    if x16.size == 0:
+        raise SystemExit(f"读不到音频或为空: {SENSE}/test_wavs/zh.wav")
     while len(x16) < RATE16 * 12:
         x16 = np.concatenate([x16, x16])
     x16 = x16[:RATE16 * 12]

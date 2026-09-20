@@ -79,7 +79,13 @@ def main() -> int:
 
     print("=" * 74)
     print(f"工具回合总数: {total}")
-    print(f"其中「首个工具之前说过话」: {with_pre}  ({with_pre / total * 100:.0f}%)" if total else "  没有工具回合")
+    # ⚠️ 除法**必须放在条件分支里面**（ocr 2026-09-20 报的）：f-string 是**先求值整个
+    #    表达式**再选择分支的，`... if total else ...` 保护不了 `with_pre / total` ——
+    #    没有工具回合时照样 `ZeroDivisionError`。而这是 P0 的验收脚本。
+    if total:
+        print(f"其中「首个工具之前说过话」: {with_pre}  ({with_pre / total * 100:.0f}%)")
+    else:
+        print("  没有工具回合")
     print()
     print("基线（规则 14 之前，2026-09-19）: 2/26 = 8%      目标: >50%")
     print("=" * 74)

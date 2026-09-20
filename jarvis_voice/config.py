@@ -148,12 +148,41 @@ class Config:
     # + `asr_min_utt_sec` + `echoguard` 三层兜底；`orchestrator` 已在播放期间
     # 把 `speech_probability` 报进 `level` 事件，攒够数据再定阈值。
 
-    # ---- 填充音 ----
+    # ---- 填充音 / 承接句 ----
+    # 两条触发路径（见 docs/WORKORDER-LEADIN-01.md）：
+    #   ① 兜底：本轮开始后 `filler_delay_ms` 还没出首句 → 播**通用池**
+    #   ② 首个 tool 事件且本轮还没出声 → 隔 `filler_tool_delay_ms` 播**按工具类别选的那句**
     filler_enabled: bool = True
-    filler_delay_ms: int = 900       # 本轮开始后等这么久还没出首句才播（避免给快回答平白加一段）
+    # 900 → 2000（2026-09-20）：照抄 Azure Voice Live `interim_response` 的 `latency`
+    # 触发默认值。**副作用是好的** —— 闲聊首句 p50 只有 2.1s，2000ms 的兜底让大部分
+    # 闲聊**不再插填充音**，正好避开调研里「filler 用太多反而差评」（Boukaram 2021，
+    # 🟡 二手转引）与 OpenAI「用不好反而增加感知延迟」。
+    filler_delay_ms: int = 2000
+    # ⚠️ **不是 0**（偏离 `PLAN-LATENCY-20260919.md` §P1 表的「delay 0」）：
+    # Roark 验收清单那条「工具 200ms 就返回 —— 填充音还该响吗？」
+    # （*a filler on a fast tool is a self-inflicted second of latency*）。
+    # delay 0 时快工具会让承接句播到一半就被 `_cancel_filler()` 切掉 → 用户听到
+    # **截断的半句话**，比静音更糟。300ms 宽限让真快工具完全不播；而本机工具步
+    # 墙钟 p50 **4.50s**（`PLAN-LATENCY-20260919.md` §1.2），300ms 在正常路径上可忽略。
+    filler_tool_delay_ms: int = 300
 
     # ---- 打断 ----
-    interrupt_confirm_ms: int = 300   # 语音持续超过此时长才算真打断（廉价版 false_interruption_timeout）
+    # 语音持续超过此时长才算真打断（廉价版 false_interruption_timeout）。
+    #
+    # ⚠️ 300 → 100（2026-09-20，离线实测）：**这一段确认是冗余的**。
+    # `vad.speaking` 取自 sherpa 的 `is_speech_detected()`，而它本身**要等
+    # `vad_min_speech`(0.25s) 的连续语音才会翻 True** —— 实测直接量化：
+    #   min_speech 0.25 → 首次 True = 语音起点 +300ms（0.15 → +200ms，0.05 → +100ms）
+    # 也就是说 VAD 已经替我们做了一次 250ms 的持续确认，这里再加 300ms
+    # 是**第二次确认**（与 `aec.py` 那个"延迟补偿两次"同型）。
+    # 而它本来要防的瞬态噪声，Silero 自己就拦得住：离线实测 60/100/150/250/400/600ms
+    # 的宽带噪声爆发（30× 噪声底）在 min_speech 取 0.25/0.15/0.05 下**都不翻 True**。
+    # 感知延迟：打断 = 语音起点 → VAD 翻 True(~min_speech) → 确认窗。
+    #   300ms → **600ms**（旧，用户反馈"打断还是不灵敏"）
+    #   100ms → **400ms**（新；再往下 50ms 也还是 400ms，被 100ms 块粒度卡住）
+    # 剩下的 250ms 是 `vad_min_speech` 的固有代价：它同时决定"多短的段算话"
+    # （`asr_min_utt_sec` 还会再兜一层），要再快就得动它，另算。
+    interrupt_confirm_ms: int = 100
     # 新爆发前的静音门槛：静得比这短 → 视为"同一次说话的延续"，不武装打断。
     # 治的是 VAD 切分长句时 speaking 的 True→False→True 抖动（真机 4 连自打断）。
     interrupt_min_gap_ms: int = 250
@@ -171,6 +200,29 @@ class Config:
     echo_guard_window_s: float = 12.0 # 只跟最近这么久内说过的文本比
 
     brain_model: str = "haiku"
+    # ---- 上下文窗口 / 自动压缩 ----
+    # ⚠️⚠️ **不设这个值，自动压缩根本不会武装。** 2026-09-20 查实（已用本机 debug 日志
+    # 双向验证）：
+    #   · Claude Code 的判定函数第一道闸是「窗口来源 ≠ auto」，来源解析顺序是
+    #     env > settings > **服务端下发（仅 firstParty）** > … > 内置 model 表 > auto
+    #   · 我们走 cc-switch 代理 → 拿不到服务端窗口表 → 来源落到 **auto** → **直接 return**
+    #   · 于是阈值**根本不算**，自动压缩永不触发
+    # 实测证据：项目历史上 **250+ 个脑会话，`compact_boundary` 与 `isCompactSummary`
+    # 统统为 0**；其中一个会话跨 **73.2 小时 / 215 轮 / 累计 370,618 token**（工具输入输出
+    # 1,436,496 字符）依然零压缩。
+    #
+    # 不设它还有第二个后果（更严重）：窗口不设 → 撞上限时只能靠 reactive 兜底
+    # （API 返回 too-long 时触发），而**代理会改写错误文案 → 那条兜底不生效** → 脑硬挂。
+    #
+    # 取值 200000 = Claude Code 对 `claude-haiku-4-5` 的标称窗口（我们报的就是这个模型名）。
+    # ⚠️ 真实后端（cc-switch → deepseek-v4.1-flash）实测 **63.9 万 token 的请求仍返回 200**
+    #    （本机 `proxy_request_logs` 11,245 条样本）；取 200K 是**保守**选择，不是上限。
+    #    保守的代价只是压缩早一点（有损），不保守的代价是撞上限后无法恢复。
+    # 为什么需要它：本机实测（同 11,245 条请求）——上下文越大首字越慢：
+    #     <20K → p50 **1295ms**（缓存命中 99.5%）   200–300K → p50 **1969ms**（5.7%）
+    #     300–600K → p50 **2431ms**（5.3%）
+    #   也就是说「上下文只增不减」会直接吃掉项目第一目标（对话感）。
+    brain_compact_window: int = 200000
 
     # ---- 脑进程启动模式（2026-09-19 常驻会话实测标定）----
     # `--bare` 会关掉 hooks / LSP / plugin sync / auto-memory / keychain /
@@ -187,11 +239,18 @@ class Config:
     #    会量出「+3.6 秒」的假数（真值只有 156ms）。必须用常驻进程量。
     brain_bare: bool = True
 
-    # ⚠️ **默认关闭**（血的教训）。`--resume` 会**链式**生成新会话，每次恢复都继承
-    # 上一次的全部上下文 —— 于是**任何**污染过的会话都会永久烘焙进链条，一直传下去。
-    # 真机踩过两次：助手带着"数到40/在的/我还活着"（我的测试对话）醒来，
-    # 用户听到的完全是陌生记忆。**这个失败模式比"重启失忆"严重得多。**
-    # 需要长期记忆时显式加 `--resume`（或 JARVIS_RESUME=1）。
+    # ⚠️ **这个 dataclass 默认值是 `False`，但应用实际跑的是「默认开」。**
+    # 顺序是：`__main__.py` 在没给 `--fresh` 时 `os.environ.setdefault("JARVIS_RESUME","1")`
+    # → `Config.load()` 读 env → 变成 `True`。**只有直接构造 `Config()` 的测试**才是 False。
+    # （2026-09-18 的交接文档 §7.1 记过这个"文档说默认关、代码实际默认开"的矛盾，
+    #   2026-09-20 统一口径为「默认开」。）
+    #
+    # 为什么默认开：个人助手要跨天记住上次聊的。
+    # ⚠️ 代价是**链式污染**：每次恢复继承上一次全部上下文，**任何**被污染的会话都会
+    # 永久烘焙进链条一直传下去 —— 真机踩过两次（助手带着"数到40/在的"这些测试对话醒来，
+    # 用户听到完全陌生的记忆）。要干净重来用 `--fresh`。
+    # ⚠️ 第二个代价（2026-09-20 实测）：链条**只增不减**，且实测自动压缩**从未武装**
+    # （见 `brain_compact_window`）→ 跑了 73 小时 / 215 轮 / 37 万 token 的会话照样在跑。
     resume_session: bool = False
 
     # ---- 记忆（注入脑层的系统提示）----
@@ -253,6 +312,8 @@ class Config:
             # AEC：延迟只给粗值（AEC3 自估）
             aec_stream_delay_ms=_env_int("JARVIS_AEC_DELAY_MS", cls.aec_stream_delay_ms),
             brain_bare=os.environ.get("JARVIS_BARE", "1") == "1",
+            brain_compact_window=_env_int("JARVIS_BRAIN_COMPACT_WINDOW",
+                                          cls.brain_compact_window),
             resume_session=os.environ.get("JARVIS_RESUME") == "1",
             persona_file=_env_str("JARVIS_PERSONA", str(JARVIS_HOME / "persona.md")),
             memory_file=_env_str("JARVIS_MEMORY", str(JARVIS_HOME / "memory.md")),

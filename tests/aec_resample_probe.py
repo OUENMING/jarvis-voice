@@ -120,13 +120,15 @@ def main():
             sizes = list(rng.integers(882, 8820, size=64))   # 20–200ms @44.1k
         fc = resample_chunked(x44, sizes)
         drift = len(fc) - len(far_whole)
-        maybe = (len(fc) - len(near))
-        if len(fc) < len(near):
-            near_i = near
-            fc_i = fc
-        else:
-            near_i = near
-            fc_i = fc[:len(near)]
+        # ⚠️⚠️ **两侧必须裁到同一个时间片**（ocr 2026-09-20 报的）。
+        # 原写法两个分支给 `near_i` 赋的都是 `near`，等于原始意图（长度不齐时同步裁剪）
+        # **根本没生效**；而 `fc` 比 `near` 短时，AEC 后半段没有参考信号
+        # → ERLE 被**系统性拉低** → 这个探针报出来的数字不可信。
+        # （这个探针是 `docs/PROBE-AEC-RESULTS-20260919.md` 里「重采样必须在消费侧、
+        #   生产侧掉 13.15 dB」那条结论的来源，所以对齐不是小事。）
+        n = min(len(near), len(fc))
+        near_i = near[:n]
+        fc_i = fc[:n]
         e, _ = erle_steady(near_i, fc_i)
         print(f"B. 分段 {label:<24} {len(fc):>8} {drift:>+7} {e:>9.2f}dB"
               f"   Δ={e-base_erle:+.2f}dB")

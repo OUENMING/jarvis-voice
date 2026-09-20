@@ -27,10 +27,10 @@ from .aec import AecGate
 from .audio_io import MicStream, resolve_device
 from .config import JARVIS_HOME, Config
 from .commands import match as match_meta
-from .echoguard import EchoGuard
+from .echoguard import EchoGuard, similarity
 from .events import BUS
 from .filler import is_backchannel, is_stop_command
-from .fillers import FillerClips
+from .fillers import TEXTS as FILLER_TEXTS, TOOL_TEXTS, FillerClips, tool_tag
 from .player import Player
 from .sanitize import has_speakable, sanitize_for_speech
 from .session import Session, State
@@ -68,7 +68,14 @@ SYSTEM_PROMPT = (
     "    ⚠️ 这条**覆盖**你默认的「不叙述例行工具调用」——那个默认对**多步任务**不适用。\n"
     "    （实测 2026-09-19：26 个工具回合里你只有 2 次这么做。而工具链中位 3 步 / 最长 28 步、\n"
     "    每步 4.5 秒 —— 不说这一句，主人要盯着十几秒的静音。）\n"
-    "15. **但只在开始一个新阶段时说，不要每次调用都说。** 说多了比静音更烦。"
+    "15. **但只在开始一个新阶段时说，不要每次调用都说。** 说多了比静音更烦。\n"
+    "16. **超过约 5 秒的活，用 Bash 的 `run_in_background` 跑**（多个 curl、大文件处理、\n"
+    "    串行好几步的计算）。启动后**立刻**回一句人话，然后你这一轮就结束 —— 跑完系统\n"
+    "    会通知你，你那时再汇报结果。（实测：前台等 6 步命令要静默 69 秒。）\n"
+    "17. **主人听到的是「你在干什么」和「结果是什么」**，不是你怎么做到的。所以：\n"
+    "    启动时说意图（「这个我放后台跑，好了喊你」），跑完说结果（「查到了，明天阴天，不下雨」）。\n"
+    "    ⛔ 唯一硬护栏：任务 ID、文件名、shell 命令、退出码、路径都**别念**——那些是给你看的。\n"
+    "    不好的例子：「已启动后台任务（ID b3tbmiy67，运行 `sleep 20; echo BACKGROUND_DONE`）」"
 )
 
 # 登录页哨兵：navigate 的目标 URL 命中这些标记就判为"撞上登录页"。
@@ -110,6 +117,7 @@ class Orchestrator:
                                   model=cfg.brain_model,
                                   disallowed_tools=list(cfg.bash_deny),
                                   bare=cfg.brain_bare,
+                                  compact_window=cfg.brain_compact_window,
                                   resume=cfg.resume_session)
 
         self.utt_q: queue.Queue = queue.Queue(maxsize=8)
@@ -120,10 +128,20 @@ class Orchestrator:
         # 启动时的预渲染线程与 TTSThread 会**同时**调 synthesize，而 FishTTS 的
         # `_ws_client` 是共享单例 —— 两个线程跑同一 WebSocket 流会交错损坏（审计发现）。
         # 加粗锁会更糟（预渲染会阻塞延迟敏感的 TTS 线程），所以干脆拆开实例。
-        self.fillers = FillerClips(make_tts(cfg)) if cfg.filler_enabled else None
+        self.fillers = (FillerClips(make_tts(cfg),
+                                    texts={FillerClips.GENERIC: list(FILLER_TEXTS),
+                                           **TOOL_TEXTS})
+                        if cfg.filler_enabled else None)
         self._filler_timer: threading.Timer | None = None
+        self._filler_played_turn: int | None = None   # 本轮已播过 —— tool 路径与兜底只能二选一
+        self._filler_lock = threading.Lock()
         self._hd_gated = False             # 半双工门控：正在因为"自己在播"而不听
         self._last_rejected = 0            # vad.rejected 的上次值（只在变化时上报，见主循环）
+        # 「非应答轮」= CC 自己起的轮次（后台任务跑完后的汇报）。见 docs/WORKORDER-ASYNC-01.md
+        self._async_pending: list[str | None] = []   # 攒着的句子；None = 该轮结束哨兵
+        self._async_turn: int | None = None          # 我们给自主轮分配的 turn id
+        self._async_spoke = False                    # 这一轮自主轮是否已出过声
+        self._async_last_ev = 0.0                    # 最后一次收到自主轮事件的时刻（看门狗用）
 
         self._shutdown_started = False     # 关机按钮防重复触发
         self._threads: list[threading.Thread] = []
@@ -221,6 +239,8 @@ class Orchestrator:
         self.mic.start()
         for t in (threading.Thread(target=self._brain_loop, name="brain", daemon=True),
                   threading.Thread(target=self._tts_loop, name="tts", daemon=True),
+                  # 非应答轮：CC 后台任务跑完会自己起一轮汇报，这里把它接成语音
+                  threading.Thread(target=self._async_loop, name="async", daemon=True),
                   # 第二大脑看门狗：Obsidian 起来后自动热重连（不必为此说话）
                   threading.Thread(target=self._memory_watchdog, name="vault-watch",
                                    daemon=True)):
@@ -291,19 +311,27 @@ class Orchestrator:
                     continue
                 # ---- AEC：先消掉我们自己播的回声，再进电平表与 VAD ----
                 # ⚠️ 必须在电平表**之前** —— 放在之后的话，仪表盘显示的是回声，会误导。
-                if self.aec is not None:
-                    chunk = self.aec.accept(chunk)
+                #
+                # ⚠️⚠️ **先把引用快照到局部变量**（ocr 2026-09-20 报的 TOCTOU）：
+                # `set_mode()` 由**仪表盘线程**调用，会在运行期把 `self.aec` 置成 `None`
+                # （见本文件 `set_mode`）。原来写的是 `if self.aec is not None: self.aec.accept()`
+                # —— 两次读取之间被置空就抛 `AttributeError`，而 `run()` 只捕
+                # `KeyboardInterrupt`，异常会冲出 while 循环 → **麦克风主循环静默终止**
+                # （其余线程还活着，表现为"应用看着正常但不再响应语音"，最难查的一类故障）。
+                aec = self.aec
+                if aec is not None:
+                    chunk = aec.accept(chunk)
                 # 麦克风电平（仪表盘电平表），节流 ~12 次/秒
                 now = time.time()
                 if now - last_level > 0.08:
                     rms = float(np.sqrt(np.mean(np.square(chunk))))
-                    if self.aec is not None:
+                    if aec is not None:
                         # 播放期间多报一个 WebRTC 自己的语音概率 ——
                         # 留着事后定 aec_min_speech_prob 的阈值（先测量，再设门限）。
                         # `dropped`/`xrun` 也带上：mic 队列溢出与采集侧溢出是两回事，
                         # 不区分就查不出音频卡顿的根因（ocr 点出的观测盲区）。
                         BUS.emit("level", rms=rms,
-                                 speech_prob=round(self.aec.speech_probability, 3),
+                                 speech_prob=round(aec.speech_probability, 3),
                                  dropped=self.mic.dropped, xrun=self.mic.status_flags)
                     else:
                         BUS.emit("level", rms=rms,
@@ -575,10 +603,72 @@ class Orchestrator:
         self.sent_q.put((turn, text))
         self.sent_q.put((turn, None))
 
-    def _run_meta(self, meta, heard: str) -> None:
-        """执行控制助手自身的元命令（见 commands.py 的说明：这些**不能**送进 CC）。"""
+    # ---------- 记忆写入 ----------
+    # `memory.md` 是**唯一**能跨「清空上下文 / 重启」留下来的地方（`--resume` 默认开，
+    # 但 `/clear` 会把会话历史整个丢掉）。此前全库**没有写入路径** —— 它是个只读的死文件。
+    #
+    # ⚠️ 社区明确警告过的一点（🟡 LangChain，2026-06-24）：
+    #    「若运行时缓存了 prompt，memory 的写入必须有**刷新路径**，否则系统存对了
+    #      却一直拿旧上下文跑。」
+    #    我们正是这样 —— `_compose_system_prompt()` 只在启动跑一次，所以这里写进去的
+    #    内容**下次启动才进系统提示**。会话内不等它：CC 本来就看得见这轮对话。
+    _MEMORY_MAX_LINES = 120       # 整份会进系统提示，不能无限长
+
+    def _remember(self, text: str) -> tuple[bool, str]:
+        """把一句话追加进 `memory.md`。返回 `(是否成功, 失败原因)`。
+
+        去重：与已有条目做字符级相似度，直接复用 `echoguard.similarity`
+        （同一个项目里已有实测过阈值的实现，不为这件事再写一个）。
+        重复时**算成功**（用户的目标「让它记住」已经达成，只是不用再写一遍）。
+        """
+        path = os.path.expanduser(self.cfg.memory_file or "")
+        if not path:
+            return False, "没配 memory_file"
+        try:
+            with open(path, encoding="utf-8") as f:
+                old = f.read()
+        except OSError:
+            old = ""
+        lines = [ln[2:] for ln in old.splitlines() if ln.startswith("- ")]
+        if any(similarity(text, ln) >= 0.75 for ln in lines):
+            self.log(f"[记忆] 已存在，跳过: {text!r}")
+            BUS.emit("memory_write", text=text, total=len(lines), duplicate=True)
+            return True, ""
+        if len(lines) >= self._MEMORY_MAX_LINES:
+            # ⚠️ **绝不自动删**（硬规矩：不删用户数据）。只提醒，压缩交给人。
+            self.log(f"[记忆] ⚠️ memory.md 已 {len(lines)} 条，超过 "
+                     f"{self._MEMORY_MAX_LINES} —— 每次启动整份注入，该人工压缩了")
+        entry = f"- {time.strftime('%Y-%m-%d')} {text}"
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                if old and not old.endswith("\n"):
+                    f.write("\n")
+                f.write(entry + "\n")
+        except OSError as e:
+            self.log(f"[记忆] 写失败: {e}")
+            return False, "文件写不进去"
+        self.log(f"[记忆] + {entry}")
+        BUS.emit("memory_write", text=text, total=len(lines) + 1)
+        return True, ""
+
+    def _run_meta(self, meta, heard: str) -> bool:
+        """执行控制助手自身的元命令（见 commands.py 的说明：这些**不能**送进 CC）。
+
+        返回 **True = 已处理完，别再送 CC**；**False = 这一句还要继续送 CC**。
+        ⚠️ 只有「记住 X」成功时返回 False —— 见 `_brain_once` 里的说明。
+        """
         self.log(f"[meta] {meta.name} ← {heard!r}")
         BUS.emit("meta", cmd=meta.name, text=heard)
+        if meta.name == "remember":
+            ok, why = self._remember(meta.payload)
+            if not ok:
+                # 写失败时**就地**告知并吃掉这一轮。
+                # ⚠️ 不能既 `_speak_local` 又 fall through：`_speak_local` 会
+                # `begin_turn()`，紧接着 CC 那轮再 `begin_turn()` 会把这条提示作废掉
+                # （同一类坑见 `session.py` 里那段"状态被踩"的注释）。
+                self._speak_local(f"没记上——{why}。")
+                return True
+            return False          # 写成功：仍送 CC，让它在**本会话内**也听见这句
         if meta.name == "clear":
             self._do_interrupt()
             ok = self.brain.clear_context()
@@ -595,28 +685,78 @@ class Orchestrator:
             # 热重连第二大脑（reconnect_memory 内含 BUS.emit 结果事件）
             ok = self.reconnect_memory()
             self._speak_local(meta.reply if ok else "没连上——Obsidian 可能没开着。")
+        return True
 
-    # ---------- 填充音 ----------
+    # ---------- 填充音 / 承接句 ----------
+    def _play_filler(self, turn: int, tag: str = FillerClips.GENERIC,
+                     trigger: str = "latency") -> bool:
+        """真正播一条。返回是否播了。
+
+        三重校验（原来写在 `_arm_filler.fire()` 里，tool 路径也要用，所以抽出来）：
+        **还是这一轮 + 还在思考 + 本轮一次都还没出过声**。
+        第三条靠 `_filler_played_turn` 保证（tool 路径与兜底定时器会同时扑过来）。
+        """
+        if not (self.fillers and self.fillers.ready()):
+            return False
+        with self._filler_lock:
+            if self._filler_played_turn == turn:
+                return False
+            self._filler_played_turn = turn
+        if not self.session.is_current(turn) or self.session.state is not State.THINKING:
+            with self._filler_lock:
+                # ⚠️ **只在标记仍属于自己这一轮时才回滚**（ocr 2026-09-20 报的）：
+                # 无条件 `= None` 会抹掉**更新的那一轮**刚设下的标记 —— 于是新一轮
+                # 还能再播一次填充音，"同一轮只播一次"的保证就破了。
+                if self._filler_played_turn == turn:
+                    self._filler_played_turn = None
+            return False
+        clip, text = self.fillers.pick(tag)
+        if not clip:
+            return False
+        self._cancel_filler()
+        self.player.write_filler(clip)
+        # ⚠️ 必须把**填充音的文本**也登记进回声护栏。填充音只 1–2 个字
+        # （"那个……"/"嗯……"），被麦克风收回去后转写出来也正是 1–2 个字 ——
+        # 正好落进 `echo_guard_min_len=6` 的保护里，不登记就永远拦不住。
+        # 真机证据：≤2 字的插话碎片里 47% 紧跟在填充音之后（正常转写只有 22%）。
+        self.echo_guard.note_spoken(text, filler=True)
+        BUS.emit("filler", delay_ms=self.cfg.filler_delay_ms, text=text,
+                 tag=tag, trigger=trigger, turn=turn)
+        state = "承接句" if tag else "填充音"
+        self.log(f"[{state}] {text!r}（trigger={trigger} tag={tag or 'generic'}）")
+        return True
+
     def _arm_filler(self, turn: int):
-        """本轮开始后 delay_ms 内还没出首句 → 播一段填充音盖住空白。
+        """**兜底路径**：本轮开始后 `filler_delay_ms` 内还没出首句 → 播通用池。
 
         实测动机：闲聊首句 1–2.5s，**工具调用 5.3–12s**。后者是纯静音灾难。
+        2000ms 之后才播 ⇒ 大部分闲聊（p50 2.1s）根本不会插进来。
         """
         self._cancel_filler()
         if not (self.fillers and self.fillers.ready()):
             return
+        self._filler_timer = threading.Timer(
+            self.cfg.filler_delay_ms / 1000.0,
+            lambda: self._play_filler(turn, FillerClips.GENERIC, "latency"))
+        self._filler_timer.daemon = True
+        self._filler_timer.start()
 
-        def fire():
-            # 三重校验：还是这一轮、还在思考、且一次都还没出声
-            if not self.session.is_current(turn) or self.session.state is not State.THINKING:
-                return
-            clip = self.fillers.pick()
-            if not clip:
-                return
-            self.player.write_filler(clip)
-            BUS.emit("filler", delay_ms=self.cfg.filler_delay_ms)
+    def _arm_lead_in(self, turn: int, tag: str):
+        """**工具路径**：首个 `tool` 事件且本轮还没出声 → 播按工具类别选的承接句。
 
-        self._filler_timer = threading.Timer(self.cfg.filler_delay_ms / 1000.0, fire)
+        ⚠️ **不是 delay 0**（偏离 `PLAN-LATENCY-20260919.md` §P1 表的「delay 0」）：
+        Roark 验收清单那条「工具 200ms 就返回 —— 填充音还该响吗？」
+        （*a filler on a fast tool is a self-inflicted second of latency*）。
+        delay 0 时快工具会让承接句播到一半就被 `_cancel_filler()` 切掉 → 用户听到
+        **截断的半句话**，比静音更糟。300ms 宽限让真快工具完全不播；而本机工具步
+        墙钟 p50 **4.50s**，300ms 在正常路径上可忽略。
+        """
+        self._cancel_filler()
+        if not (self.fillers and self.fillers.ready()):
+            return
+        self._filler_timer = threading.Timer(
+            self.cfg.filler_tool_delay_ms / 1000.0,
+            lambda: self._play_filler(turn, tag, "tool"))
         self._filler_timer.daemon = True
         self._filler_timer.start()
 
@@ -682,8 +822,12 @@ class Orchestrator:
             return
         meta = match_meta(r.text)
         if meta:
-            self._run_meta(meta, r.text)
-            return
+            # 「记住 X」写成功时 `_run_meta` 返回 False → **继续往下送 CC**。
+            # 否则 CC 在**本会话内**根本不知道这件事（我们把话截在了它前面），
+            # 五分钟后再问「我下周三要干嘛」它会答不上来。
+            # 写文件由我们保证，不给 CC 这个任务，所以它只会口头应一声。
+            if self._run_meta(meta, r.text):
+                return
         if busy:
             # 用户在我们说话时插了句**真话**。旧版直接 return = 静默丢弃用户输入。
             # 正确行为：人在这种时候会停下来听。所以要打断，然后处理这句新输入。
@@ -738,6 +882,10 @@ class Orchestrator:
                 elif et == "tool":
                     self.log(f"  [工具] {ev.get('name')}")
                     BUS.emit("tool", name=ev.get("name"), input=ev.get("input"))
+                    # 本轮一次都还没出声 = CC **没说** preamble → 我们补一句承接句。
+                    # ⚠️ `first` 为假说明 CC 自己已经说过了 → **绝不补**（否则一句变两句）。
+                    if first:
+                        self._arm_lead_in(turn, tool_tag(ev.get("name") or ""))
                     # 登录页哨兵（**观测**）：规则 12 要求模型撞上登录页就停手，
                     # 这个事件用来验证它到底有没有照做。没有这个数就不知道规则有没有用。
                     _host = self._login_target(ev)
@@ -759,6 +907,120 @@ class Orchestrator:
             # bridge 的 _turn_lock 会一直被持有 → 下一次 ask() 直接返回 "busy"，
             # 表现是"助手突然不回应了"。此前只是碰巧被 GC 救了，时机不确定。
             gen.close()
+
+    # ---------- AsyncThread（非应答轮）----------
+    # 为什么需要单独一条线程：CC 在**后台任务跑完**后会自己起一轮汇报结果
+    # （实测见 docs/WORKORDER-ASYNC-01.md §1：t=23.09 通知 → t=25.23 说结果）。
+    # 那轮的帧由桥接分流到 `next_async()`，不走 `ask()` —— 所以编排器要有人接。
+    #
+    # ⚠️ **不使用 `_do_interrupt`**：自主轮不是用户发起的，没有"被打断"的对象；
+    #    用户在说话时我们只是**先不播**（攒着），不去抢话。
+    def _async_loop(self):
+        while not self._stop.is_set():
+            try:
+                ev = self.brain.next_async(timeout=0.3)
+                if ev is None:
+                    self._async_watchdog()
+                    self._flush_async()
+                    continue
+                self._async_last_ev = time.time()
+                self._handle_async(ev)
+            except Exception as e:
+                # 与其它线程同规矩：异常只记录、继续跑（静默死线程是最难查的一类故障）
+                self.log(f"[async] 异常（已捕获，线程存活）: {type(e).__name__}: {e}")
+                time.sleep(0.1)
+
+    def _handle_async(self, ev: dict):
+        et = ev.get("type")
+        if et == "system":
+            sub = ev.get("subtype")
+            # 两类都走这条：后台任务生命周期、以及 `compact_boundary`/`api_error`
+            # 这类「系统事件」。用中性措辞，别一律叫「后台任务」。
+            self.log(f"[async] 系统事件 {sub} {ev.get('task_id') or ''} "
+                     f"{ev.get('status') or ''}".rstrip())
+            BUS.emit("background_task", subtype=sub, task_id=ev.get("task_id"),
+                     status=ev.get("status"), output_file=ev.get("output_file"),
+                     summary=ev.get("summary"))
+            return
+        if et == "tool":
+            self.log(f"  [async 工具] {ev.get('name')}")
+            return
+        if et == "sentence":
+            clean = sanitize_for_speech(ev.get("text") or "")
+            if has_speakable(clean):
+                self._async_pending.append(clean)
+            self._flush_async()
+            return
+        if et == "async_done":
+            self._async_pending.append(None)      # 哨兵：自主轮到这儿结束
+            self._flush_async()
+            return
+
+    def _flush_async(self):
+        """把攒下的自主轮句子播出去。**忙就等**（用户在说话/在听时不去抢话）。
+
+        允许续播的两种情形：① 会话空闲；② 非空闲但这轮**本来就是我们自己的**
+        （自主轮可能分几批吐句子，中间不能因为"state 不是 IDLE"就卡死）。
+        """
+        if not self._async_pending:
+            return
+        if (self.session.state is not State.IDLE
+                and not self.session.is_current(self._async_turn if self._async_turn is not None else -1)):
+            return
+        # ⚠️ **自愈**：自主轮可能已经被用户插话作废（`session.interrupt()` 换了 turn id）。
+        # 不复位的话，下面会用那个**过期 id** 往 sent_q 里塞，TTS 侧 `is_current` 判假
+        # → 句子被静默丢掉，而且 `_async_turn` 会永远卡着（既不播也不清）。
+        # 复位成 None → 下面重新 `begin_turn()`，把攒下的句子在**新的一轮**里播出来
+        # （后台结果即使被打断也仍然有用，不该丢）。
+        if self._async_turn is not None and not self.session.is_current(self._async_turn):
+            self._async_turn = None
+            self._async_spoke = False
+        if self._async_turn is None:
+            self._async_turn = self.session.begin_turn()
+            self._async_spoke = False
+        turn = self._async_turn
+        while self._async_pending:
+            text = self._async_pending.pop(0)
+            if text is None:                      # 该轮结束
+                # ⚠️ `_async_spoke` 必须是**实例状态**，不能用本次调用的局部变量：
+                # 句子和 async_done 常分两次调用到达（第一批句子排空后队列为空，
+                # 下一次 flush 才拿到哨兵）—— 局部变量那时已经重置成 False，
+                # 哨兵就永远发不出去 → 状态卡在 SPEAKING。
+                if self._async_spoke:
+                    self.sent_q.put((turn, None))  # TTS 播完会自己 finish_turn → IDLE
+                self._async_turn = None
+                return
+            self._note_spoken(text)               # 回声护栏比对基准
+            if not self._async_spoke:
+                self._set_state(State.SPEAKING)
+                self._async_spoke = True
+            self.sent_q.put((turn, text))
+            self.log(f"[async 说] {text}")
+
+    def _async_watchdog(self):
+        """收尾保护。三种情况：
+        ① 轮次已被作废（用户插话打断）→ 这个自主轮过时了，**丢弃**攒着的句子
+           （⚠️ 不丢的话它们会永远卡在 `_async_pending` 里：`_flush_async` 的头一道闸
+              `is_current` 永远为假 → 既不播也不清，是个静默泄漏）
+        ② 队列里还有句子 → 还没轮到收尾
+        ③ 开了口却再没收到任何事件 → 兜底补哨兵，别把状态卡在 SPEAKING
+        """
+        if self._async_turn is None:
+            return
+        if not self.session.is_current(self._async_turn):
+            self.log(f"[async] 自主轮已被作废 → 丢弃剩余 {len(self._async_pending)} 句")
+            self._async_pending.clear()
+            self._async_turn = None
+            return
+        if self._async_pending:
+            return
+        if time.time() - self._async_last_ev < self._ASYNC_IDLE_CLOSE_S:
+            return
+        self.log("[async] 自主轮超时未收尾 → 强制结束")
+        turn, self._async_turn = self._async_turn, None
+        self.sent_q.put((turn, None))
+
+    _ASYNC_IDLE_CLOSE_S = 8.0
 
     # ---------- TTSThread ----------
     def _tts_loop(self):

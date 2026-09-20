@@ -67,6 +67,56 @@ if not ok:
 print(f"{'✅' if ok else '❌'} 超出时间窗后不再判为回声（相似度 {score:.2f}）")
 
 print()
+print("=== 填充音回声（2026-09-20 新增，走独立的短窗口通道）===")
+print("--- 应当拦下：这正是填充音自己说的话 ---")
+for heard in ("那个。", "那个？", "那个.", "嗯。", "嗯."):
+    g = EchoGuard()
+    g.note_spoken("那个……", filler=True)
+    g.note_spoken("嗯……", filler=True)
+    hit, score, match = g.check(heard)
+    ok = hit is True
+    if not ok:
+        FAILS += 1
+    print(f"{'✅' if ok else '❌'} 填充音被收回去: {heard!r} → {'拦住' if hit else '放行'} "
+          f"(相似度 {score:.2f})")
+
+print("--- 必须放行 ---")
+g = EchoGuard()
+g.note_spoken(SPOKEN)                                   # 只有正常句子，没有填充音
+hit, _, _ = g.check("那个。")
+ok = hit is False
+if not ok:
+    FAILS += 1
+print(f"{'✅' if ok else '❌'} 没播过填充音时，用户短句照旧放行: {hit is False}")
+
+g = EchoGuard()
+g.note_spoken("那个……", filler=True)
+hit, score, _ = g.check("好的")
+ok = hit is False
+if not ok:
+    FAILS += 1
+print(f"{'✅' if ok else '❌'} 填充音在窗口内，但用户说的是别的短句 → 放行 (相似度 {score:.2f})")
+
+# ⚠️ 这条是 `short != is_filler` 那条规则的关键保护：
+#    用户长句里**含**填充音的词，若拿长句去比短填充音，LCS 比例会虚高到 1.0。
+g = EchoGuard()
+g.note_spoken("我看一下。", filler=True)
+hit, score, _ = g.check("你帮我看一下明天的天气")
+ok = hit is False
+if not ok:
+    FAILS += 1
+print(f"{'✅' if ok else '❌'} 用户长句含填充音的词（「我看一下」）→ 放行 (相似度 {score:.2f})")
+
+g = EchoGuard(filler_window_s=0.2)
+g.note_spoken("那个……", filler=True)
+time.sleep(0.35)
+hit, _, _ = g.check("那个。")
+ok = hit is False
+if not ok:
+    FAILS += 1
+print(f"{'✅' if ok else '❌'} 超出填充音窗口(0.2s)后不再拦: {hit is False}")
+
+print()
 print("=== 相似度函数的性质 ===")
 PROPS = [
     ("自身相似度为 1", similarity("abcde", "abcde") == 1.0),

@@ -29,8 +29,25 @@ class SayTTS:
         self.chunk_bytes = chunk_bytes
         self._proc: subprocess.Popen | None = None
         self._interrupted = False       # stop() 置位，让 yield 循环提前结束
-        # ⚠️ 必须加锁：填充音的**预渲染线程**与 TTSThread 会同时用同一个实例，
-        # 两者都写 self._proc → 可能杀错/漏杀子进程（审计发现）。
+        # ⚠️ 锁保护的是一组**实例级**的可变状态（`_proc` / `_interrupted`）。
+        #
+        # 🔴 **本类当前不支持「多线程共用同一个实例」**（ocr 2026-09-20 报的，
+        #    已回原码核实结论为**潜伏、当前不可达**）：
+        #    · `orchestrator` 给填充音预渲染用的是 `make_tts(cfg)` 的**另一个实例**
+        #      （`orchestrator.py:131`，注释里写明了这是刻意的）
+        #    · `self.tts.stop()` **从没被调用过** —— 唯一的调用点是 `close()`
+        #    所以现在不会有两个线程同时压同一个实例。
+        #
+        # ⚠️ 但**一旦有人改接线**（比如把 `self.tts` 也交给预渲染线程，或让打断去调
+        #    `self.tts.stop()`），这里就会坏，而且是静默地坏：
+        #      ① `synthesize()` 开头无条件 `_interrupted = False` → 并发 `stop()` 的
+        #         打断标志被吞掉，前一次的 `_proc` 句柄丢失、再也杀不掉
+        #      ② `_proc` 只记「最近一个」→ 重叠渲染时 `stop()` 只能终止后写入的那个
+        #      ③ 实例级 `_interrupted` 分不清「本次调用」还是「上一次/并发」→
+        #         会把真实的非零退出掩盖成「已打断」
+        #    **要支持并发就得把打断做成调用级状态**（每次 `synthesize` 生成自己的
+        #    Event/token 传进 `_render`），光加锁不够。在那之前，请保持"一个实例一个
+        #    使用者"。
         self._lock = threading.Lock()
 
     def _render(self, text: str) -> bytes:

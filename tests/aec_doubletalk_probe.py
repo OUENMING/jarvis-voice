@@ -12,6 +12,7 @@
 """
 import os
 import sys
+import time
 import wave
 
 import numpy as np
@@ -94,10 +95,13 @@ def main():
     print("\n请念这一句（念 2-3 遍，每遍之间稍停）：\n", flush=True)
     print("    帮我把那个文件移到备份目录里，原目录就别留了\n", flush=True)
     print("现在开始 12 秒预备（保持安静，这一段用作稳态参照）…\n", flush=True)
+    # ⚠️ **先打印再 sleep**（ocr 2026-09-20 报的）：原写法是 `sleep(3)` 之后才 print
+    # `{s} 秒后开始播放`，于是每一条都比实际晚了 3 秒 —— 第一句说"12 秒后"时其实只剩 9 秒，
+    # 最后一句说"3 秒后"时应该**立刻**开口。照提示念的人会整体晚 3 秒，
+    # 双讲段与提示时序错位 → 测量结论不可信。
     for s in (12, 9, 6, 3):
-        import time
-        time.sleep(3)
         print(f"    {s} 秒后开始播放 → 听到声音就开始念", flush=True)
+        time.sleep(3)
 
     _, _, _, _ = None, None, None, None
     # 预备段：只录不说话（拿稳态 ERLE 的干净参照）

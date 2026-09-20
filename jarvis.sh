@@ -25,8 +25,13 @@ stop_all() {
   for p in $(pids "$APP_PAT"); do kill "$p" 2>/dev/null && n=$((n+1)); done
   [ "$n" -gt 0 ] && { echo "  已发 SIGTERM 给 $n 个应用进程…"; sleep 2; }
   for p in $(pids "$APP_PAT") $(pids "$BRAIN_PAT"); do kill -9 "$p" 2>/dev/null && echo "  强杀 $p"; done
-  # 兜底：释放仪表盘端口
-  for p in $(lsof -ti:8848 2>/dev/null || true); do kill -9 "$p" 2>/dev/null && echo "  强杀占用 8848 的 $p"; done
+  # 兜底：释放仪表盘端口。
+  # ⚠️ 必须 `-sTCP:LISTEN` 只取**监听者**（ocr 2026-09-20 报的）：
+  #    裸 `lsof -ti:8848` 会连**已建立连接的客户端**一起列出来 —— 也就是**浏览器**。
+  #    原来的无差别 `kill -9` 会在 `stop` 时把用户正开着的浏览器标签页（或浏览器本身）杀掉。
+  for p in $(lsof -ti:8848 -sTCP:LISTEN 2>/dev/null || true); do
+    kill -9 "$p" 2>/dev/null && echo "  强杀占用 8848 的监听进程 $p"
+  done
   sleep 1
 }
 
