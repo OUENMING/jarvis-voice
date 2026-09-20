@@ -1,0 +1,30 @@
+# 运行时依赖（Python 3.14，macOS Apple Silicon）
+#
+#   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+#
+# ⚠️ 只做到「装得上」。本项目**必须在 macOS 上跑**：兜底 TTS 用系统自带的 `say`，
+#    设备选择依赖 CoreAudio 的设备名，音频回调依赖 sounddevice 的 PortAudio 后端。
+
+# ---- 音频 I/O ----
+sounddevice==0.5.6          # PortAudio 绑定（麦克风 + 扬声器）
+numpy==2.5.3
+scipy==1.18.1               # resample_poly（far 参考重采样）
+
+# ---- VAD + ASR（本地，free）----
+sherpa-onnx==1.13.7         # Silero VAD + SenseVoice ASR；模型见 README「安装」
+
+# ---- 免提 AEC ----
+pywebrtc-audio==0.2.0       # WebRTC AEC3 的 Python 绑定（cp314 macOS arm64 有轮子）
+
+# ---- TTS（云，Fish Audio）----
+httpx==0.28.1
+
+# ---- 本地仪表盘（只绑 127.0.0.1）----
+fastapi==0.141.1
+uvicorn==0.52.4
+pydantic==2.13.5
+
+# ---- 仅测试用（F0 统计，验证 Fish 的情感标签是否有效）----
+# 不装也能跑主程序；跑 tests/test_fish_emotion*.py 才需要。
+# librosa
+# soundfile
