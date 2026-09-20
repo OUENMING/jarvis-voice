@@ -17,6 +17,10 @@ import sherpa_onnx
 
 from .config import Config
 
+# 噪声底初次估计要看的块数（每块 = mic_blocksize/16000 = 100ms）→ 12 块 ≈ 1.2s。
+# 为什么需要它：见 `_update_floor` 的注释 —— 直接采信第一块会把 floor 锁成语音电平。
+_FLOOR_PROBE_CHUNKS = 12
+
 
 class VadGate:
     def __init__(self, cfg: Config):
@@ -41,8 +45,10 @@ class VadGate:
         self.vad = sherpa_onnx.VoiceActivityDetector(vcfg, buffer_size_in_seconds=60)
         self._buf: np.ndarray = np.zeros(0, dtype=np.float32)
         # 噪声底：快速下降、缓慢上升（经典做法）。用于段级信噪比门限。
+        # ⚠️ 0.0 = **还没估出来**（哨兵值），不是"噪声底是 0"。
         self._floor = 0.0
-        self.rejected = 0          # 被 SNR 门限丢弃的段数（可观测）
+        self._floor_probe = 0      # 初次估计已看了多少块（见 _FLOOR_PROBE_CHUNKS）
+        self.rejected = 0          # 被 SNR 门限丢弃的段数（**累计量，reset 不清零**：留着看历史）
         # ⚠️ sherpa 的 VAD **不是线程安全的**。仪表盘的"恢复监听"会从 uvicorn 线程
         # 调 reset()，而主线程同时在 accept_waveform —— 并发会让内部状态损坏，
         # 表现为"VAD 从此不再出段 = 助手不响应"（异常还会被线程护栏吞掉，极难查）。
@@ -50,8 +56,36 @@ class VadGate:
 
     # ---- 噪声底 ----
     def _update_floor(self, chunk: np.ndarray):
+        """维护噪声底。快降慢升（经典做法）。
+
+        ⚠️⚠️ **初次估计不能直接采信第一块。** 原写法
+        `if self._floor == 0.0 or rms < self._floor: self._floor = rms` 有个 high 级缺陷
+        （`ocr` 代码审查 2026-09-20 报的）：
+          `_floor == 0.0` 同时表示"未初始化"和"实测为 0"，于是**第一块**（很可能整块
+          就是语音，比如刚启动时主人正在说话）直接把 floor 设成语音电平。此后
+          `need = max(floor * vad_min_snr, vad_min_rms)` = **3× 语音** 恒大于真语音段 RMS
+          → **只要主人在连续说话，段就一直被 `_passes_gate` 丢掉，助手不响应**；
+          只有等到某个明显更静的块才把 floor 拉下来。
+        这还会**叠加到话首**上：讲话的开头本来就有 VAD 的 min_speech_duration 延迟，
+        再叠一层"前几百毫秒被门限丢"，声母更容易没。
+
+        修法：前 `_FLOOR_PROBE_CHUNKS` 块取**最小值**（噪声底就是观测到的最小值），
+        并把结果**封顶在 `vad_min_rms`**（项目的绝对下限）—— 这样：
+          · 首块是语音 → 封顶后 need 最多 3×0.012=0.036，真语音（~0.05）能过
+          · 噪声大的房间 → 也不会因为一次性采信某块而把 floor 抬得过高
+        探针期结束后回到原有的快降慢升（那段逻辑没动）。
+        """
         rms = float(np.sqrt(np.mean(np.square(chunk)))) if chunk.size else 0.0
-        if self._floor == 0.0 or rms < self._floor:
+        if rms <= 0.0:
+            return
+        if self._floor_probe < _FLOOR_PROBE_CHUNKS:
+            cur = rms if self._floor == 0.0 else min(self._floor, rms)
+            # 封顶在绝对下限：防止"首块即语音"把门限抬成 3×语音。
+            # `max(..., 1e-6)` 防有人把 vad_min_rms 配成 0（那会让 need 恒为 0，什么都放行）。
+            self._floor = min(cur, max(self.cfg.vad_min_rms, 1e-6))
+            self._floor_probe += 1
+            return
+        if rms < self._floor:
             self._floor = rms                      # 立即跟随下降
         else:
             self._floor = 0.995 * self._floor + 0.005 * rms   # 缓慢上升
@@ -119,6 +153,15 @@ class VadGate:
             return bool(self.vad.is_speech_detected())
 
     def reset(self):
+        """重新干净地开始听。**必须连噪声底一起复位** —— 见 `_update_floor` 的注释。
+
+        ⚠️ 原实现只复位 VAD 与 `_buf`，`_floor` 会带着**上一个会话的值**穿过来：
+        4 个调用点（orchestrator `:304` `:308` 半双工门、`:426` 仪表盘「恢复监听」、
+        `:480` 切模式）之后，新一轮真人语音仍在用旧门限判定 —— 若旧值偏高就继续被丢。
+        `rejected` 刻意**不**清零：它是累计诊断量，清零会丢掉历史。
+        """
         with self._lock:                      # 与 accept() 串行化（仪表盘线程会调它）
             self.vad.reset()
             self._buf = np.zeros(0, dtype=np.float32)
+            self._floor = 0.0                 # 哨兵：让它按新会话重新估计
+            self._floor_probe = 0
