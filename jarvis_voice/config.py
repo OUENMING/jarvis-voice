@@ -205,6 +205,20 @@ class Config:
     # 0.8s 的顿。**调大更稳但顿得更久，调小则拦不住**；要 A/B 再定。
     bargein_grace_ms: int = 800
 
+    # ---- P2：轮次协商（**默认关**，见 docs/PLAN-HUMANNESS-20260920.md P2）----
+    # 「说几句 → 主动停一下 → 等接话」。把「一次说完」变成**留出插话的槽位**：
+    # 用户不必"抢"话，而是被邀请接话 —— 这才是对话感的来源。
+    #
+    # ⚠️ **为什么默认 0（关）**：停顿是**净增加**的时间（3 句 × 600ms = +1.8s），
+    # 而 CUI'25 实测「延迟 >4s 是头号体验杀手」。**如果用户从不接话，这就是纯亏。**
+    # 计划里写死了：**必须先 A/B 量过再定值，甚至可能整体否掉。**
+    #
+    # A/B 用法（同场景各跑一场）：
+    #   JARVIS_TURN_YIELD_MS=600 ./jarvis.sh start --speaker-aec --dashboard
+    # 看什么：① 总时长变长多少 ② 用户真的接话了吗 ③ 听感上是「在等我」还是「卡了」
+    turn_yield_ms: int = 0        # 0 = 关
+    turn_yield_after_sentences: int = 2   # 第几句之后停（只停这一次，不是每句都停）
+
     # ---- 回声文本护栏（装 AEC 之前的纯文本兜底，零延迟）----
     # 动机：内置扬声器 + 内置麦时，AEC 残余会越过 VAD 门限被转写；若进了脑，
     # 助手就会**回应自己**（HANDOVER §1 明确列为不可接受："不能凭空自言自语"）。
@@ -332,6 +346,9 @@ class Config:
             brain_bare=os.environ.get("JARVIS_BARE", "1") == "1",
             brain_compact_window=_env_int("JARVIS_BRAIN_COMPACT_WINDOW",
                                           cls.brain_compact_window),
+            turn_yield_ms=_env_int("JARVIS_TURN_YIELD_MS", cls.turn_yield_ms),
+            turn_yield_after_sentences=_env_int("JARVIS_TURN_YIELD_AFTER",
+                                                cls.turn_yield_after_sentences),
             resume_session=os.environ.get("JARVIS_RESUME") == "1",
             persona_file=_env_str("JARVIS_PERSONA", str(JARVIS_HOME / "persona.md")),
             memory_file=_env_str("JARVIS_MEMORY", str(JARVIS_HOME / "memory.md")),

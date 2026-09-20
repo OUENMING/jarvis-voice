@@ -139,6 +139,11 @@ class Orchestrator:
         self._last_rejected = 0            # vad.rejected 的上次值（只在变化时上报，见主循环）
         # 待决的自动打断（VAD 起音已暂停、还在等转写判断）。None = 没有待决的。
         self._pending_bargein_at: float | None = None
+        # P2 轮次协商：只在本轮记「第几句」，用锁是因为 TTSThread 是唯一写者，
+        # 但 `_tts_loop` 每轮都从队列取，跨轮复用同一组字段。
+        self._yield_turn: int | None = None
+        self._yield_count = 0
+        self._yield_lock = threading.Lock()
         # 「非应答轮」= CC 自己起的轮次（后台任务跑完后的汇报）。见 docs/WORKORDER-ASYNC-01.md
         self._async_pending: list[str | None] = []   # 攒着的句子；None = 该轮结束哨兵
         self._async_turn: int | None = None          # 我们给自主轮分配的 turn id
@@ -1129,3 +1134,37 @@ class Orchestrator:
                 self.player.write(ch)
         finally:
             gen.close()
+        self._maybe_yield_turn(turn)
+
+    # ---------- P2：轮次协商（默认关）----------
+    def _maybe_yield_turn(self, turn: int):
+        """说满 N 句之后**主动停一下**，把插话的槽位让出来。
+
+        ⚠️ 默认关闭（`turn_yield_ms=0`）。停顿是**净增加**的时间，而 CUI'25 实测
+        「延迟 >4s 是头号体验杀手」——**用户不接话就是纯亏**。见 config 的注释与
+        docs/PLAN-HUMANNESS-20260920.md P2：**先 A/B 量过再定值**。
+
+        为什么不需要任何新机制：打断由主循环独立处理，用户在停顿里开口 →
+        `_begin_bargein` → 提交 → `session.interrupt()` → 下一句的 `is_current`
+        判假 → TTS 自然停。这里只负责"停一下"本身。
+        """
+        if self.cfg.turn_yield_ms <= 0:
+            return
+        with self._yield_lock:
+            if self._yield_turn != turn:
+                self._yield_turn, self._yield_count = turn, 0
+            self._yield_count += 1
+            n = self._yield_count
+        if n != self.cfg.turn_yield_after_sentences:
+            return
+        if self.sent_q.empty():
+            return                     # 后面没别的句子了，让给谁？
+        # 等这一句真播完再停 —— 否则会把它从中间切断
+        while (not self._stop.is_set() and self.player.is_playing()
+               and self.session.is_current(turn)):
+            time.sleep(0.02)
+        if not self.session.is_current(turn):
+            return                     # 等待期间被打断了，不用再让
+        self.log(f"[P2] 第 {n} 句后让出 {self.cfg.turn_yield_ms}ms 等接话")
+        BUS.emit("turn_yield", ms=self.cfg.turn_yield_ms, after_sentence=n)
+        time.sleep(self.cfg.turn_yield_ms / 1000.0)
