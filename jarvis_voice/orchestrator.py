@@ -297,8 +297,14 @@ class Orchestrator:
         """主线程 = 麦克风循环 + VAD + 打断检测。"""
         self.start()
         self.log("=" * 64)
-        if self.cfg.barge_in:
+        # ⚠️ 按 `audio_mode` **三路**分，不能按 `barge_in` 两路 ——
+        # `barge_in` 在 headphones 与 speaker_aec 下都是 True，两路分会把
+        # `--speaker-aec` 显示成「耳机模式」（真机踩到：2026-09-20 起机时横幅写错）。
+        # 这行是**用户唯一会看到的模式说明**，写错等于骗人。
+        if self.cfg.audio_mode == "headphones":
             self.log("JARVIS · 耳机模式（说完自动接话；播报中直接插话即可打断）Ctrl+C 退出")
+        elif self.cfg.audio_mode == "speaker_aec":
+            self.log("JARVIS · 免提 + AEC（说完自动接话；**播报中直接插话即可打断**）Ctrl+C 退出")
         else:
             self.log("JARVIS · 免提模式（无 AEC → 半双工：播出时不听麦克风，**不能插话打断**）")
             self.log("        仍可用仪表盘的「打断」按钮手动打断。Ctrl+C 退出")
