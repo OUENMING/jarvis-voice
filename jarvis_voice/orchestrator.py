@@ -485,6 +485,11 @@ class Orchestrator:
                     else:
                         self.log(f"⚡ [打断-超时] {self.cfg.bargein_grace_ms}ms 内没有转写 → 提交")
                         self.trace.dump("timeout", state=st.value)
+                        # ⚠️ 提交前**必须清窗口**：`_commit_interrupt` 自己不碰这个字段，
+                        # 不清的话下一轮循环会再判一次超时 → 那时状态已是 IDLE →
+                        # 落到"本轮已自然结束"那支。真机日志里 22 次超时**每次**都
+                        # 紧跟一条多余的撤回，就是这个。
+                        self._pending_bargein_at = None
                         self._commit_interrupt()
                 prev_silence = silence_since if silence_since is not None else prev_silence
         except KeyboardInterrupt:
@@ -938,7 +943,13 @@ class Orchestrator:
                 # 真机观测到打断时高频被削 4-5 倍，但成因有两类（AEC 压近端 vs
                 # 麦+距离本身丢高频），**修法完全不同**，只能靠这个 A/B 分开。
                 if self.aec is not None:
-                    self.trace.save_pcm(self.aec.raw_slice(len(utt)), "bargein-raw")
+                    # ⚠️ 必须带 `end_offset`：段里的音频比"此刻"早至少
+                    # `min_silence_duration`（VAD 等静音才吐段）+ 排队时间。
+                    # 不带的话取到的是**段之后**的窗，前后对照根本对不上
+                    # （实测互相关只有 0.1-0.3）。
+                    _off = int(self.cfg.vad_min_silence * self.cfg.sample_rate)
+                    self.trace.save_pcm(
+                        self.aec.raw_slice(len(utt) + _off, _off), "bargein-raw")
             except Exception:
                 self._trace_utt_path = None
         r = self.asr.transcribe(utt)

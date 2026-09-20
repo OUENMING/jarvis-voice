@@ -136,16 +136,21 @@ class AecGate:
         except Exception:
             return 0.0
 
-    def raw_slice(self, n: int) -> np.ndarray:
-        """最近 n 个**未过 AEC**的原始近端样本（诊断 A/B 用）。
+    def raw_slice(self, n: int, end_offset: int = 0) -> np.ndarray:
+        """取**未过 AEC**的原始近端：从 `end_offset + n` 个样本前，到 `end_offset` 个样本前。
 
-        ⚠️ 近端不过重采样、进出等长 → 原始流与输出流同时钟同长度，
-        所以"最近 n 个"就是与 AEC 输出同一时间窗，不需要位置映射。
+        诊断 A/B 用。⚠️ `end_offset` 是必需的，不能只取"最近 n 个"：
+        VAD 要等 `min_silence_duration`(0.5s) 静音之后才吐段，所以**段里的音频
+        比"此刻"早至少 0.5 秒** —— 直接取最近 n 个会拿到段之后的窗口，对不上。
+        （写第一版时就是漏了这个，互相关相关度只有 0.1-0.3，根本没法比。）
         """
-        n = max(0, min(int(n), self._raw_cap, self.fed))
+        n = max(0, int(n)); off = max(0, int(end_offset))
+        avail = max(0, self.fed - off)
+        n = min(n, self._raw_cap, avail)
         if n == 0:
             return np.zeros(0, dtype=np.int16)
-        idx = (self._raw_w - n + np.arange(n)) % self._raw_cap
+        end = (self._raw_w - off) % self._raw_cap
+        idx = (end - n + np.arange(n)) % self._raw_cap
         return self._raw[idx].copy()
 
     def reset(self):
