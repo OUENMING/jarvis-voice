@@ -3,9 +3,22 @@
 为什么需要：内置扬声器 + 内置麦时，麦克风听到的就是我们自己。没有 AEC 时只能
 关掉打断 + 播放期间不听麦克风（`config.half_duplex`），代价是免提下无法插话。
 实测本机稳态 ERLE 34–36 dB / ACOM ≈ 40 dB（docs/PROBE-AEC-RESULTS-20260919.md）。
+⚠️ 但 **ERLE 只在单讲有意义**，双讲下不适用 —— 它证明不了"打断时识别没问题"。
 
 **far 参考的质量是这里唯一的优势**：我们知道**确切**在播什么（`Player` 的镜像），
 比任何通用 AEC 拿到的参考都干净。
+
+## 两个后端（`config.aec_backend`）
+
+| | 干什么 | 双讲时 |
+|---|---|---|
+| `webrtc`（默认） | 自适应滤波 **＋ NLP 残余抑制** | ⚠️ **把近端一起压掉**（辅音全在高频，先丢）|
+| `speex` | **只做线性**抵消（无残余抑制） | ✅ 保留近端；代价是**单讲消得差**（57→11 dB）|
+
+`webrtc` 压近端是**真机定案的根因**（原始麦克风 4–8k 13–17.5% → 过 AEC 剩 0.1–0.3%，
+`docs/ROOTCAUSE-BARGEIN-ASR-20260920.md`）。离线 20 个合成双讲场景比转写错误率：
+`speex` **8.0%** vs `webrtc` **39.8%**（`tools/aec_ab.py --sweep`）。
+⚠️ 合成≠真机 ⇒ 留这个切换开关是为了**真机再 A/B 一次**。
 
 ⚠️⚠️ **重采样必须在这一侧（消费侧）做，绝不在 `Player.write()` 里做。**
 实测（docs/PROBE-AEC-RESULTS-20260919.md §6.5）：生产侧按块重采样时，
@@ -14,7 +27,7 @@
 → **稳态 ERLE 从 26.5 dB 掉到 13.3 dB**。消费侧的块长是固定的（近端 100ms@16k
 = 1600 样本 → 需要 4410 个 44.1k 样本，恰好是 441×10），**精确无漂移**。
 
-⚠️ 本类**只在主循环线程**被调用 —— `AudioProcessor` 非线程安全（一手）。
+⚠️ 本类**只在主循环线程**被调用 —— 后端非线程安全（一手）。
 """
 import numpy as np
 from scipy.signal import resample_poly
@@ -23,27 +36,151 @@ UP, DOWN = 160, 441          # 44.1k → 16k
 INT16 = 32768.0
 
 
-class AecGate:
-    """`accept()` 收近端（麦克风）float32，返回消掉回声后的同规格信号。"""
+def _ring_write(buf: np.ndarray, w: int, x: np.ndarray) -> int:
+    """把 `x` 写进环形缓冲 `buf`（当前写指针 `w`），返回新写指针。"""
+    n = x.shape[0]
+    cap = buf.shape[0]
+    if n >= cap:
+        buf[:] = x[-cap:]
+        return 0
+    end = w + n
+    if end <= cap:
+        buf[w:end] = x
+    else:
+        k = cap - w
+        buf[w:] = x[:k]
+        buf[:end - cap] = x[k:]
+    return end % cap
 
-    def __init__(self, cfg, player):
-        from pywebrtc_audio import AudioProcessor   # 延迟导入：不开 AEC 时不付代价
 
-        self.cfg = cfg
-        self.player = player
-        self.rate = cfg.sample_rate
+def _ring_read(buf: np.ndarray, w: int, n: int, end_offset: int = 0) -> np.ndarray:
+    """从环形缓冲 `buf`（写指针 `w`）取**倒数第 `end_offset + n` 到第 `end_offset`** 个样本。"""
+    cap = buf.shape[0]
+    end = (w - max(0, int(end_offset))) % cap
+    idx = (end - n + np.arange(n)) % cap
+    return buf[idx].copy()
+
+
+# ══════════════════════ AEC 后端（内部接缝；两个实现才叫真接缝） ══════════════════════
+
+class _WebrtcBackend:
+    """WebRTC AEC3：自适应滤波 **＋ NLP 残余抑制**。
+
+    ⚠️ 损伤来自 NLP —— 双讲时它会把近端语音一起压掉（辅音全在高频，先丢）。
+    详见 `docs/ROOTCAUSE-BARGEIN-ASR-20260920.md`。
+    """
+
+    name = "webrtc"
+
+    def __init__(self, rate: int):
+        from pywebrtc_audio import AudioProcessor   # 延迟导入：不选它就不付代价
         self.ap = AudioProcessor(
-            sample_rate=self.rate,
+            sample_rate=rate,
             echo_cancellation=True,
             # 实测 aec 与 aec_ns 的转写**逐字相同** → NS 不伤语音，可以开。
             noise_suppression=True,
             high_pass_filter=True,
             # ⚠️ AGC 必须关：它会改增益，干扰项目自己的电平统计与 VAD 噪声底。
             auto_gain_control=False,
-            # ⚠️ 恒为 0：far 参考已在下面往前读 150ms 做过物理对齐，
+            # ⚠️ 恒为 0：far 参考已在 `AecGate.accept()` 里往前读 150ms 做过物理对齐，
             # 对齐后残余延迟 ≈0 —— 这里再给 150 = 补偿两次 → ERLE 39 dB 掉到 1 dB。
             stream_delay_ms=0,
         )
+
+    def process(self, near_i16: np.ndarray, far_i16: np.ndarray) -> np.ndarray:
+        return np.asarray(self.ap.process(near_i16, far_i16), dtype=np.int16)
+
+    def reset(self) -> None:
+        self.ap.reset()
+
+    @property
+    def speech_probability(self) -> float:
+        """WebRTC 自己的语音概率（0–1）。播放期间可用作第二道确认。"""
+        try:
+            return float(self.ap.speech_probability)
+        except Exception:
+            return 0.0
+
+
+class _SpeexBackend:
+    """SpeexDSP 的**纯线性**分块频域自适应滤波 —— **不做残余抑制**。
+
+    **为什么选它**：`speex_echo_cancellation()` 的输出是 `麦克风 − 滤波后回声`，
+    它**本身不做频谱后滤波**（源码 `mdf.c`：`power_1` 是自适应步长，不是输出增益）。
+    会压近端的那级残余抑制在 `speex_preprocess_run()` 里 —— 而 aec-rs 的
+    `enable_preprocess` 参数正好能把它关掉。**关掉就是我们要的"只做线性抵消"**。
+
+    离线 20 个合成双讲场景（660 字）转写错误率：本后端 **8.0%** vs WebRTC **39.8%**。
+    ⚠️ 合成 ≠ 真机，所以这个切换开关存在的意义就是**在真机上再 A/B 一次**。
+
+    ⚠️ **aec-rs 的固有缺陷**（不是用法错误，改不掉）：它从不调
+    `SPEEX_ECHO_SET_SAMPLING_RATE`，而 `libaec.dylib` **只导出 3 个 Aec* 符号**
+    （`nm -gU` 核实）→ Speex 内部**永远认为采样率是 8000**。我们喂 16k 时
+    `beta0 = 2*frame_size/8000` 比正确值大一倍（泄漏翻倍）→ 收敛上限被压低。
+    实测纯回声下 WebRTC 能到 57 dB、本后端只有 11 dB。**这正是"牺牲单讲换双讲"**。
+
+    ⚠️ 要求**定长帧**（`FRAME`）。`mic_blocksize=1600` 恰好 = 10 帧，整除，
+    所以正常路径下不需要缓冲、也没有额外延迟；万一不整除，余数**原样透传**
+    并记进 `unframed`（可观测），不会静默出错。
+    """
+
+    name = "speex"
+    FRAME = 160                      # 10ms @16k；Speex 的标定帧长
+
+    def __init__(self, rate: int, filter_length: int):
+        try:
+            from pyaec import Aec        # 延迟导入
+        except ImportError as e:         # 响亮失败，别静默退回 webrtc
+            raise ImportError(
+                "aec_backend=speex 需要 pyaec：`.venv/bin/pip install pyaec`"
+                "（或把 JARVIS_AEC_BACKEND 改回 webrtc）") from e
+        self.rate = rate
+        self._aec = Aec(frame_size=self.FRAME, filter_length=filter_length,
+                        sample_rate=rate, enable_preprocess=False)
+        self.filter_length = filter_length
+        self.unframed = 0            # 没走 AEC 的样本数（正常恒为 0）
+
+    def process(self, near_i16: np.ndarray, far_i16: np.ndarray) -> np.ndarray:
+        n = int(near_i16.shape[0])
+        k = (n // self.FRAME) * self.FRAME
+        out = np.array(near_i16, dtype=np.int16)      # 余数先按原样占位
+        for i in range(0, k, self.FRAME):
+            out[i:i + self.FRAME] = self._aec.cancel_echo(
+                near_i16[i:i + self.FRAME].tolist(),
+                far_i16[i:i + self.FRAME].tolist())
+        self.unframed += n - k
+        return out
+
+    def reset(self) -> None:
+        # pyaec 不暴露 reset → 重建（它没有需要保留的外部状态）。
+        from pyaec import Aec
+        self._aec = Aec(frame_size=self.FRAME, filter_length=self.filter_length,
+                        sample_rate=self.rate, enable_preprocess=False)
+        self.unframed = 0
+
+    @property
+    def speech_probability(self) -> float:
+        return 0.0                    # Speex 不提供；调用方已按 0 处理
+
+
+def _make_backend(cfg) -> _WebrtcBackend | _SpeexBackend:
+    kind = (cfg.aec_backend or "webrtc").lower()
+    if kind == "webrtc":
+        return _WebrtcBackend(cfg.sample_rate)
+    if kind == "speex":
+        return _SpeexBackend(cfg.sample_rate, cfg.aec_speex_filter_length)
+    raise ValueError(f"未知 aec_backend={kind!r}（可选 webrtc / speex）")
+
+
+class AecGate:
+    """`accept()` 收近端（麦克风）float32，返回消掉回声后的同规格信号。"""
+
+    def __init__(self, cfg, player):
+        self.cfg = cfg
+        self.player = player
+        self.rate = cfg.sample_rate
+        # 后端可切（`aec_backend`）—— 选谁完全藏在 `accept()` 后面，调用方无感。
+        self.be = _make_backend(cfg)
         self._delay_frames = int(cfg.aec_stream_delay_ms / 1000.0 * 44100)
         self._far_read = 0                   # 最近一次用的 far 读位置（仅用于观测）
         self.fed = 0                         # 喂进去的近端样本数（可观测）
@@ -57,6 +194,13 @@ class AecGate:
         self._raw_cap = self.rate * 30       # 留 30s 够用
         self._raw = np.zeros(self._raw_cap, dtype=np.int16)
         self._raw_w = 0
+        # 🆕 **far 参考**（实际喂给 AEC3 的那份）的环形缓冲。
+        # 为什么要它：判「近端是被 AEC 压坏的，还是本来就差」需要**同一时间窗**的
+        # far。没有 far 就只能猜，有了它才能离线用别的 AEC 重跑同一段音频。
+        # ⚠️ 长度与 `_raw` **逐样本锁定**：`far_i16` 在下面被裁/补到与 `near_i16`
+        #    等长（`n16`），所以两个写指针永远同值 —— 这是构造保证，不是约定。
+        self._far = np.zeros(self._raw_cap, dtype=np.int16)
+        self._far_w = 0
 
     # ---- 主入口 ----
     def accept(self, chunk_f32: np.ndarray) -> np.ndarray:
@@ -108,33 +252,23 @@ class AecGate:
         self._far_read += need44
 
         near_i16 = np.clip(chunk_f32 * INT16, -INT16, INT16 - 1).astype(np.int16)
-        # 存原始近端（诊断用，见 __init__ 的说明）。O(1)，无分配。
-        n = near_i16.shape[0]
-        if n >= self._raw_cap:
-            self._raw[:] = near_i16[-self._raw_cap:]
-            self._raw_w = 0
-        else:
-            end = self._raw_w + n
-            if end <= self._raw_cap:
-                self._raw[self._raw_w:end] = near_i16
-            else:
-                k = self._raw_cap - self._raw_w
-                self._raw[self._raw_w:] = near_i16[:k]
-                self._raw[:end - self._raw_cap] = near_i16[k:]
-            self._raw_w = end % self._raw_cap
         far_i16 = np.clip(far16 * INT16, -INT16, INT16 - 1).astype(np.int16)
-        clean = self.ap.process(near_i16, far_i16)
+        # 存原始近端与 far（诊断用，见 __init__ 的说明）。O(1)，无分配。
+        self._raw_w = _ring_write(self._raw, self._raw_w, near_i16)
+        self._far_w = _ring_write(self._far, self._far_w, far_i16)
+        clean = self.be.process(near_i16, far_i16)
         self.fed += n16
         return np.asarray(clean, dtype=np.float32) / INT16
 
     # ---- 观测 / 控制 ----
     @property
+    def backend_name(self) -> str:
+        return self.be.name
+
+    @property
     def speech_probability(self) -> float:
-        """WebRTC 自己的语音概率（0–1）。播放期间可用作第二道确认。"""
-        try:
-            return float(self.ap.speech_probability)
-        except Exception:
-            return 0.0
+        """后端自己的语音概率（0–1）；Speex 不提供，恒 0。播放期间可作第二道确认。"""
+        return self.be.speech_probability
 
     def raw_slice(self, n: int, end_offset: int = 0) -> np.ndarray:
         """取**未过 AEC**的原始近端：从 `end_offset + n` 个样本前，到 `end_offset` 个样本前。
@@ -149,13 +283,31 @@ class AecGate:
         n = min(n, self._raw_cap, avail)
         if n == 0:
             return np.zeros(0, dtype=np.int16)
-        end = (self._raw_w - off) % self._raw_cap
-        idx = (end - n + np.arange(n)) % self._raw_cap
-        return self._raw[idx].copy()
+        return _ring_read(self._raw, self._raw_w, n, off)
+
+    def far_slice(self, n: int, end_offset: int = 0) -> np.ndarray:
+        """取**实际喂给 AEC 的 far 参考**，时间窗与 `raw_slice(n, end_offset)` 完全相同。
+
+        配对使用才有意义：`(raw_slice(...), far_slice(...))` 就是「那一刻 AEC 看到的
+        近端与远端」。拿到这一对，就能离线用**别的** AEC 重跑同一段音频，
+        直接比谁的输出转写更准 —— 不用再跑真机。
+        """
+        n = max(0, int(n)); off = max(0, int(end_offset))
+        avail = max(0, self.fed - off)
+        n = min(n, self._raw_cap, avail)
+        if n == 0:
+            return np.zeros(0, dtype=np.int16)
+        return _ring_read(self._far, self._far_w, n, off)
 
     def reset(self):
         """切模式 / 换设备时调 —— AEC 内部状态重来（读指针每次都是从播放时钟算的）。"""
-        self.ap.reset()
+        self.be.reset()
         self._raw[:] = 0
         self._raw_w = 0
+        self._far[:] = 0
+        self._far_w = 0
         self._far_read = 0
+        # ⚠️ `fed` 必须一起清 —— 它只被 `raw_slice`/`far_slice` 当"可用量"用。
+        # 留着旧值的话，reset 后那两个方法会**返回一大段全零**，看起来像"有数据，
+        # 只是安静"，而真相是"还没有数据"。诊断工具给出误导性数据比报错更糟。
+        self.fed = 0

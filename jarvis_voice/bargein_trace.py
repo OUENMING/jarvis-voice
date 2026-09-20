@@ -113,7 +113,17 @@ class BargeinTrace:
         return self.path
 
     # ---- 打断音频落盘 ----
-    def save_pcm(self, pcm_int16, tag: str, sample_rate: int = 16000) -> str | None:
+    def new_stem(self) -> str:
+        """生成一个共享前缀，供**同一次打断**的多份落盘文件用。
+
+        为什么要它：一次打断要存 3 份（过 AEC / 未过 AEC / far 参考）。各自调
+        `save_pcm` 会各自取时间戳，毫秒一差名字就对不上，事后只能靠"时间上相邻"猜配对。
+        用同一个 stem 之后，配对就是看文件名 —— 不用猜。
+        """
+        return f"{time.strftime('%H%M%S')}-{int(time.time() * 1000) % 1000:03d}"
+
+    def save_pcm(self, pcm_int16, tag: str, sample_rate: int = 16000,
+                 stem: str | None = None) -> str | None:
         """把一段语音存成 wav，供事后**离线复听 / 重转写**。
 
         为什么要它：用户报「它一说话我打断，识别就很差」。看电平只能猜到"有干扰"，
@@ -123,15 +133,16 @@ class BargeinTrace:
           · 段被截头去尾（ASR 缺前导上下文）
 
         存到 `~/.jarvis/bargein-audio/`，只保留最近 `_KEEP` 个。
+        `stem` 见 `new_stem()`：同一次打断的多份必须传**同一个** stem 才能配对。
         """
         if not self.enabled or pcm_int16 is None:
             return None
         d = os.path.join(os.path.dirname(self.path), "bargein-audio")
         try:
             os.makedirs(d, exist_ok=True)
-            name = (f"{time.strftime('%H%M%S')}-"
-                    f"{int(time.time() * 1000) % 1000:03d}-{tag}.wav")
-            path = os.path.join(d, name)
+            pre = stem or (f"{time.strftime('%H%M%S')}-"
+                           f"{int(time.time() * 1000) % 1000:03d}")
+            path = os.path.join(d, f"{pre}-{tag}.wav")
             with wave.open(path, "wb") as w:
                 w.setnchannels(1)
                 w.setsampwidth(2)

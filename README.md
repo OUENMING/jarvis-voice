@@ -25,7 +25,9 @@
 
 ### 核心功能
 
-- **免提也能打断** — 软件 AEC（`pywebrtc-audio` + 自己的 far 参考），本机稳态 **ERLE 34–36 dB**
+- **免提也能打断** — 软件 AEC + 自己的 far 参考（我们**确切知道**在播什么）。
+  **两个后端可切**（`JARVIS_AEC_BACKEND`）：`webrtc` = WebRTC AEC3（单讲最强），
+  `speex` = SpeexDSP **纯线性**（不压近端）。原因见下
 - **工具轮不等静默** — 承接句（按工具类别选句子）+ **异步工具**（长任务转后台、回合立刻收尾）
 - **本地元命令** — 「清空上下文 / 暂停 / 记住 X / 连第二大脑」在编排层就地处理，不消耗一轮 CC
 - **长期记忆** — `persona.md`（人工）+ `memory.md`（说「记住 X」确定性追加），启动时注入系统提示
@@ -45,7 +47,7 @@
 | 闲聊首句 | **p50 2.1s** | 无工具调用 |
 | TTS 首包 | **478ms** | Fish REST（换 REST 前是 1559ms）|
 | 打断延迟 | **400ms** | 语音起点 → 停（修前 600ms）|
-| AEC 稳态 ERLE | **34–36 dB** | 免提，本机 |
+| AEC 稳态 ERLE | **34–36 dB** | 免提，本机。⚠️ **仅单讲有意义**，双讲下这个指标不适用 |
 | 工具轮首句 | p50 **14.3s** / p90 49.3s | ⚠️ 修承接句与异步工具**之前**测的，见「已知限制」|
 
 ## 功能清单
@@ -56,7 +58,7 @@
 | ASR | SenseVoice（本地、免费）+ 专名纠正表 | sherpa-onnx | 2026-09-20 |
 | 打断 | VAD 起音触发，带静音门槛防抖动误判 | 自研状态机 | 2026-09-20 |
 | 打断误判恢复 | 起音先暂停（留缓冲），转写若是「嗯」这类应答就**接着播** | 自研（LiveKit 同款语义）| 2026-09-20 |
-| 免提 AEC | WebRTC AEC3 + far 参考锚在播放时钟上 | pywebrtc-audio | 2026-09-19 |
+| 免提 AEC | 两后端可切（WebRTC AEC3 / SpeexDSP 线性）+ far 参考锚在播放时钟上 | pywebrtc-audio / pyaec | 2026-09-20 |
 | 承接句 | 按工具类别播预渲染短句（覆盖 98% 工具调用）| 自研 | 2026-09-20 |
 | 异步工具 | 长任务转后台，回合提前收尾、跑完自动汇报 | Claude Code 后台任务 | 2026-09-20 |
 | 填充音 | 预渲染音频盖住思考期空白 | 自研 | 2026-09-20 |
@@ -75,7 +77,8 @@
 | Claude Code | 2.1.278 | **脑**：常驻 `claude` 子进程（stream-json）| https://claude.com/claude-code |
 | sherpa-onnx | 1.13.7 | Silero VAD + SenseVoice ASR（**本地**）| https://github.com/k2-fsa/sherpa-onnx |
 | SenseVoice | 2024-07-17 | ASR 模型（中英日韩粤）| https://github.com/FunAudioLLM/SenseVoice |
-| pywebrtc-audio | 0.2.0 | WebRTC AEC3（免提回声消除）| https://pypi.org/project/pywebrtc-audio |
+| pywebrtc-audio | 0.2.0 | WebRTC AEC3（免提回声消除，默认后端）| https://pypi.org/project/pywebrtc-audio |
+| pyaec | 1.0.1 | SpeexDSP 线性 AEC（`JARVIS_AEC_BACKEND=speex`，见下）| https://pypi.org/project/pyaec |
 | Fish Audio | s2.1-pro-free | 云 TTS（REST 流式）| https://fish.audio |
 | sounddevice | 0.5.6 | PortAudio 绑定（麦克风 / 扬声器）| https://python-sounddevice.readthedocs.io |
 | FastAPI + uvicorn | 0.141 / 0.52 | 本地仪表盘 | https://fastapi.tiangolo.com |
@@ -109,7 +112,7 @@ jarvis-voice/
 │   ├── config.py              # 全部配置与阈值（env 可覆盖）
 │   ├── session.py             # 状态（IDLE/THINKING/SPEAKING）+ 轮次作废
 │   ├── audio_io.py            # MicStream + 设备解析
-│   ├── aec.py                 # 免提 AEC 门（far 参考锚在播放时钟上）
+│   ├── aec.py                 # 免提 AEC 门（两后端可切；far 参考锚在播放时钟上）
 │   ├── player.py              # sounddevice 回调播放 + far 镜像
 │   ├── vad.py                 # VAD 门 + 信噪比门限 + 预滚缓冲
 │   ├── asr.py                 # SenseVoice（本地）/ Fish（云）+ 专名纠正
@@ -124,7 +127,8 @@ jarvis-voice/
 │   └── tts/                   # base / fish(REST 流式) / say(兜底)
 ├── claude_bridge.py           # 常驻 claude 子进程（stream-json、可中断、非应答轮分流）
 ├── jarvis.sh                  # 启停脚本（**杀进程必须用它**）
-├── tests/                     # 29 个独立测试脚本
+├── tests/                     # 35 个独立测试脚本
+├── tools/                     # 离线实验工具（`aec_ab.py`：合成双讲场景比两个 AEC 后端）
 ├── docs/                      # 调研 / 施工单 / 修复记录（索引见 docs/README.md）
 ├── models/                    # VAD + ASR 模型（230MB，**不入库**，见「安装」）
 └── requirements.txt
@@ -198,6 +202,7 @@ cp mcp-jarvis.example.json mcp-jarvis.local.json   # 这个文件名已在 .giti
 | `JARVIS_{INPUT,OUTPUT}_DEVICE` | 设备名子串（免提必须两个都切）|
 | `JARVIS_BARE=0` | 非 bare：拿到 skills + 懒加载工具，每轮 +156ms |
 | `JARVIS_BRAIN_COMPACT_WINDOW` | 脑的上下文窗口。**不设 = 自动压缩永不触发**（见开发笔记 #3）|
+| `JARVIS_AEC_BACKEND` | `webrtc`（默认）/ `speex`（线性，不压近端）。见 [`docs/AEC-AB-20260920.md`](docs/AEC-AB-20260920.md) |
 
 ### 说几句就能做的事
 
@@ -255,6 +260,10 @@ for t in tests/test_*.py; do .venv/bin/python "$t" >/dev/null 2>&1 \
 - **打断误判恢复的窗口值（800ms）没在真机上调过**：它是按链路时延推的。误判撤回时，
   一句话中间会多一个约 0.8s 的顿 —— 这个代价要 A/B 才知值不值
 - **对话人味只到约七成**：缺重叠说话 / 副语言交换 / 轮次协商（`docs/PLAN-HUMANNESS-20260920.md`）。而且**助手每轮说 75 字 vs 用户 10 字（7.5 倍）** —— 一次说太多
+- **免提打断时说的话识别差 —— 根因已定案，A/B 未做**：WebRTC AEC3 在**双讲**时会把近端
+  语音一起压掉（辅音全在高频，先丢）。离线 20 个合成双讲场景比转写错误率：
+  `webrtc` **39.8%** vs `speex` **8.0%** —— 但**合成≠真机**，
+  `JARVIS_AEC_BACKEND=speex` 的真机验收**还没做**。见 [`docs/AEC-AB-20260920.md`](docs/AEC-AB-20260920.md)
 - **免提只能消自己的回声**：环境里别人的声音（网课、视频）它消不掉，那需要说话人分离。放视频请用耳机
 - **上下文只增不减**：`--resume` 链式累积，修了压缩窗口但仍会跑在 100–180K 区间（首字比 <20K 时慢约 1.5 倍）
 - **情绪识别只通了一半**：ASR 拿到情绪标签，但**没有驱动 TTS**（Fisher 的情感标签实测无效）
@@ -279,6 +288,8 @@ for t in tests/test_*.py; do .venv/bin/python "$t" >/dev/null 2>&1 \
 | [`docs/FIXES-VOICE-20260920.md`](docs/FIXES-VOICE-20260920.md) | 语音层修复 + **上下文膨胀实测** + 自动压缩未武装的根因 |
 | [`docs/FIXES-AUDIO-20260920.md`](docs/FIXES-AUDIO-20260920.md) | AEC 上线后的音频修复 + **已证伪假设清单** |
 | [`docs/PLAN-HUMANNESS-20260920.md`](docs/PLAN-HUMANNESS-20260920.md) | 对话「人味」方案 |
+| [`docs/ROOTCAUSE-BARGEIN-ASR-20260920.md`](docs/ROOTCAUSE-BARGEIN-ASR-20260920.md) | **打断时识别差的根因定案**（AEC3 双讲压近端）+ 诊断基建 |
+| [`docs/AEC-AB-20260920.md`](docs/AEC-AB-20260920.md) | **换 AEC 的离线 A/B 结果 + 真机验收步骤**（含"near-end SDR 预测不了转写"）|
 | [`docs/OCR-REVIEW-20260920.md`](docs/OCR-REVIEW-20260920.md) | 第三方代码审查的核实账 |
 
 ## License

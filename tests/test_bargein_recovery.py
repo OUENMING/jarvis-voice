@@ -230,21 +230,14 @@ g.fed = 0
 
 
 def feed_raw(gate, arr):
-    """复刻 accept() 里写原始环的那段（不跑 AEC，避免造 AudioProcessor）。"""
-    n = arr.shape[0]
-    if n >= gate._raw_cap:
-        gate._raw[:] = arr[-gate._raw_cap:]
-        gate._raw_w = 0
-    else:
-        end = gate._raw_w + n
-        if end <= gate._raw_cap:
-            gate._raw[gate._raw_w:end] = arr
-        else:
-            k = gate._raw_cap - gate._raw_w
-            gate._raw[gate._raw_w:] = arr[:k]
-            gate._raw[:end - gate._raw_cap] = arr[k:]
-        gate._raw_w = end % gate._raw_cap
-    gate.fed += n
+    """复刻 accept() 里写原始环的那段（不跑 AEC，避免造 AudioProcessor）。
+
+    ⚠️ 必须调**生产同一个** `_ring_write` —— 手抄一份的话，生产改了这里不会红，
+    测试就变成在验证一个不存在的实现。（原来这里确实手抄了一份。）
+    """
+    from jarvis_voice.aec import _ring_write
+    gate._raw_w = _ring_write(gate._raw, gate._raw_w, arr)
+    gate.fed += arr.shape[0]
 
 
 a = np.arange(1, 3001, dtype=np.int16)

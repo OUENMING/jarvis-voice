@@ -15,6 +15,8 @@ sherpa-onnx==1.13.7         # Silero VAD + SenseVoice ASR；模型见 README「�
 
 # ---- 免提 AEC ----
 pywebrtc-audio==0.2.0       # WebRTC AEC3 的 Python 绑定（cp314 macOS arm64 有轮子）
+pyaec==1.0.1                # SpeexDSP 的线性 AEC（`JARVIS_AEC_BACKEND=speex` 时才用；
+                            # 不装也能跑默认后端。见 tools/aec_ab.py 的对比）
 
 # ---- TTS（云，Fish Audio）----
 httpx==0.28.1

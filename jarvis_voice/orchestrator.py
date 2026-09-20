@@ -38,6 +38,12 @@ from .session import Session, State
 from .tts import make_tts
 from .vad import VadGate
 
+# 打断音频诊断的配对窗口：从「打断发生」到「那段语音被 VAD 吐出来交给 ASR」能隔多久。
+# ⚠️ 这个窗口要**够宽**：用户可以在打断之后继续说很久（VAD 要等 `min_silence_duration`
+# 静音才吐段），长句实测 1.5–2s，用户继续讲 10s 也正常。太窄 = 又变成"只有短句才存"。
+# 松一点的风险只是把**下一句**无关的话也标成打断 —— 而那只多存一份音频，无害。
+BARGEIN_UTT_WINDOW_S = 30.0
+
 # 口语化强约束 system prompt —— 实测有效（docs/RESEARCH-NATURALNESS-20260916.md §6.1）
 SYSTEM_PROMPT = (
     "你是 Aries（欧文的私人语音助手）。你说的每句话都会被**逐字朗读**出来，所以必须按口语写。\n"
@@ -140,6 +146,10 @@ class Orchestrator:
         self._last_rejected = 0            # vad.rejected 的上次值（只在变化时上报，见主循环）
         # 待决的自动打断（VAD 起音已暂停、还在等转写判断）。None = 没有待决的。
         self._pending_bargein_at: float | None = None
+        # 诊断专用：最近一次**打断发生**的时刻。与 `_pending_bargein_at` 分开存，
+        # 因为后者会在 800ms 超时提交时被清掉、state 也会回 IDLE —— 而那时用户
+        # 那段语音还没被 VAD 吐出来。见 `_brain_once` 里的说明。
+        self._bargein_utt_at: float | None = None
         # P2 轮次协商：只在本轮记「第几句」，用锁是因为 TTSThread 是唯一写者，
         # 但 `_tts_loop` 每轮都从队列取，跨轮复用同一组字段。
         self._yield_turn: int | None = None
@@ -313,7 +323,11 @@ class Orchestrator:
         if self.cfg.audio_mode == "headphones":
             self.log("JARVIS · 耳机模式（说完自动接话；播报中直接插话即可打断）Ctrl+C 退出")
         elif self.cfg.audio_mode == "speaker_aec":
-            self.log("JARVIS · 免提 + AEC（说完自动接话；**播报中直接插话即可打断**）Ctrl+C 退出")
+            # ⚠️ 后端名必须出现在这里。真机 A/B 时最怕的就是"以为自己切了，其实没切"
+            # —— `JARVIS_AEC_BACKEND` 拼错会**响亮**报错（见 `_make_backend`），
+            # 但这行横幅是**一眼确认**，比翻日志快。
+            self.log(f"JARVIS · 免提 + AEC[{self.cfg.aec_backend}]"
+                     "（说完自动接话；**播报中直接插话即可打断**）Ctrl+C 退出")
         else:
             self.log("JARVIS · 免提模式（无 AEC → 半双工：播出时不听麦克风，**不能插话打断**）")
             self.log("        仍可用仪表盘的「打断」按钮手动打断。Ctrl+C 退出")
@@ -507,6 +521,7 @@ class Orchestrator:
         if self._pending_bargein_at is not None:
             return                          # 窗口已经开着，别重复开
         self._pending_bargein_at = time.time()
+        self._bargein_utt_at = self._pending_bargein_at   # 诊断用，跨状态重置存活
         self.player.pause()
         self.log(f"⚡ [打断-待定] 已暂停，等 {self.cfg.bargein_grace_ms}ms 内的转写判断")
         BUS.emit("bargein_pending", grace_ms=self.cfg.bargein_grace_ms)
@@ -927,31 +942,50 @@ class Orchestrator:
             return
         if self._paused.is_set():
             return          # 暂停期间不处理（麦克风侧也在丢弃）
+        # 诊断：这一句是**打断**来的吗？**读一次就清**，且要在下面所有提前 return
+        # （太短被丢、空段）**之前**取 —— 否则标志会留着标到下一句无关的话上。
+        #
+        # ⚠️⚠️ **判据不能用状态机的瞬态标志**（原来是 `state != IDLE or 有待定窗口`）。
+        # 真机 2026-09-20 15:5x 揭穿：8 次打断**一份音频都没落盘**，因为
+        #   ① 短句（「看到了看到了」）转写在 382ms 就到了 → 那时窗口还开着 → 条件真 ✅
+        #   ② 长句（「呃，等一下，你知道那个明天天气怎么样吗？」）VAD 要等更久才吐段，
+        #      转写晚于 800ms → `[打断-超时]` 已经**清窗口 + 把 state 置成 IDLE** → 条件假 ❌
+        # 而「超时提交」恰恰是最常见的那条路（真机 22/25）。
+        # ⇒ 诊断必须有自己的时间戳，**跨状态重置存活**。见 `_bargein_utt_at`。
+        _bargein = (self._bargein_utt_at is not None
+                    and (time.time() - self._bargein_utt_at) <= BARGEIN_UTT_WINDOW_S)
+        self._bargein_utt_at = None
         if len(utt) / self.cfg.sample_rate < self.cfg.asr_min_utt_sec:
             # ⚠️ 这里是**静默丢弃** —— 以前丢了什么都不说，所以「说了助手没反应」
             # 这类现象无法从日志定位。报出来（带时长），让失败可见。
             self.log(f"[drop] 段太短 {len(utt)/self.cfg.sample_rate:.2f}s "
                      f"< asr_min_utt_sec={self.cfg.asr_min_utt_sec}s → 丢弃")
             return
-        # 诊断：这一句是**打断**来的吗？是就把音频存下来（事后能复听/重转写）。
-        # ⚠️ 判据要在 `_resolve_bargein` **之前**取 —— 它会把 `_pending_bargein_at` 清掉。
-        # `state != IDLE` 或"有待定窗口"都算打断：前者是它正在播/想，后者是刚起音。
-        if self.session.state is not State.IDLE or self._pending_bargein_at is not None:
+        if _bargein:
             try:
-                self._trace_utt_path = self.trace.save_pcm(utt, "bargein")
-                # 🆕 同时存一份**未过 AEC** 的原始近端 —— 同一时间窗的前后对照。
-                # 真机观测到打断时高频被削 4-5 倍，但成因有两类（AEC 压近端 vs
-                # 麦+距离本身丢高频），**修法完全不同**，只能靠这个 A/B 分开。
+                _stem = self.trace.new_stem()      # 三份共用前缀 → 事后能按名字配对
+                self._trace_utt_path = self.trace.save_pcm(utt, "bargein", stem=_stem)
+                # 🆕 同时存一份**未过 AEC** 的原始近端 + **far 参考** —— 同一时间窗的前后对照。
+                # 近端证「AEC 压掉了多少」；far 是**离线换 AEC 重跑**的前提：
+                # 有这一对 (near_raw, far)，就能在电脑上直接比 WebRTC vs 其他 AEC
+                # 谁的输出转写更准 —— **不用再跑一次真机**。
                 if self.aec is not None:
                     # ⚠️ 必须带 `end_offset`：段里的音频比"此刻"早至少
                     # `min_silence_duration`（VAD 等静音才吐段）+ 排队时间。
                     # 不带的话取到的是**段之后**的窗，前后对照根本对不上
                     # （实测互相关只有 0.1-0.3）。
                     _off = int(self.cfg.vad_min_silence * self.cfg.sample_rate)
+                    _n = len(utt) + _off
                     self.trace.save_pcm(
-                        self.aec.raw_slice(len(utt) + _off, _off), "bargein-raw")
+                        self.aec.raw_slice(_n, _off), "bargein-raw", stem=_stem)
+                    self.trace.save_pcm(
+                        self.aec.far_slice(_n, _off), "far", stem=_stem)
             except Exception:
                 self._trace_utt_path = None
+            # 存不下来也要**说出来**。这个诊断曾经整整一轮真机一份都没存，
+            # 而日志里只有"没有那条成功行"——等于沉默失败。见 `_brain_once` 的说明。
+            if self._trace_utt_path is None:
+                self.log("[打断] ⚠️ 音频没存下来（bargein_trace 关闭 / 写盘失败）")
         r = self.asr.transcribe(utt)
         # 诊断：这一句如果是**打断**来的（或刚在待定窗口），把音频存下来 ——
         # 用户报「它一说话我打断识别就差」，光看电平只能猜到"有干扰"，

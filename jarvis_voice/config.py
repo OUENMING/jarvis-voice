@@ -142,6 +142,28 @@ class Config:
     #   far 偏移    0（读未来，镜像是空的）→ 生产不可达
     # OCR 代码审查在 `aec.py:66` 独立指出「延迟被补偿了两次」。
     aec_stream_delay_ms: int = 150
+
+    # ---- AEC 后端（可切；仅 audio_mode == "speaker_aec" 生效）----
+    #   "webrtc" = pywebrtc-audio AEC3：自适应滤波 **＋ NLP 残余抑制**
+    #   "speex"  = pyaec/SpeexDSP：**纯线性**分块频域滤波，**不做残余抑制**
+    #
+    # **为什么要能切**：真机实测「它一说话我打断，识别就很差」，定案是
+    # **AEC3 在双讲时削掉近端高频**（原始麦克风 4–8k 13–17.5% → 过 AEC 只剩
+    # 0.1–0.3%；见 `docs/ROOTCAUSE-BARGEIN-ASR-20260920.md`）。
+    # 离线拿 20 个合成双讲场景（660 字）比**转写错误率**（`tools/aec_ab.py --sweep`）：
+    #     speex 线性 **8.0%**  vs  webrtc **39.8%**
+    # ⚠️ 合成 ≠ 真机（没有真实房间、没有笔记本麦）⇒ **必须真机再 A/B 一次**才定论。
+    # ⚠️ 顺带否掉一个指标：**近端 SDR 预测不了转写** —— 三种变体的 SDR 几乎相同
+    #    （−0.6/−0.7/−0.1 dB），转写却差 5 倍。别再用它选 AEC，要用真 ASR。
+    #
+    # 跑真机 A/B：`JARVIS_AEC_BACKEND=speex ./jarvis.sh start --speaker-aec`
+    # （两种后端都会把 `(未过 AEC 的近端, far)` 落盘 → 事后可离线互换复算）
+    aec_backend: str = "webrtc"
+    # Speex 的回声尾长（样本 @16k）。3200 = 200ms：够覆盖 150ms 物理延迟 + 房间混响。
+    # ⚠️ 实测不是越长越好：6400 时转写错误率 11.0%（3200 是 8.0%）—— 抽头多、收敛慢，
+    #    而我们每次打断只有几秒音频。
+    aec_speex_filter_length: int = 3200
+
     # 注：`RESEARCH-AEC-20260919.md` §2.3 的三层防线（播放期间抬高 SNR 门限 /
     # speech_probability 双确认）**尚未实现** —— 那两个阈值没有实测数据可依据，
     # 先不设死配置（避免重犯 §7.5「死配置」的坑）。当前靠已有的段级 SNR 门限
@@ -364,6 +386,9 @@ class Config:
             audio_mode=_env_str("JARVIS_AUDIO_MODE", cls.audio_mode),
             # AEC：延迟只给粗值（AEC3 自估）
             aec_stream_delay_ms=_env_int("JARVIS_AEC_DELAY_MS", cls.aec_stream_delay_ms),
+            aec_backend=_env_str("JARVIS_AEC_BACKEND", cls.aec_backend),
+            aec_speex_filter_length=_env_int("JARVIS_AEC_SPEEX_FL",
+                                             cls.aec_speex_filter_length),
             brain_bare=os.environ.get("JARVIS_BARE", "1") == "1",
             brain_compact_window=_env_int("JARVIS_BRAIN_COMPACT_WINDOW",
                                           cls.brain_compact_window),
