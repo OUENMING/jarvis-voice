@@ -40,7 +40,9 @@ class AecGate:
             high_pass_filter=True,
             # ⚠️ AGC 必须关：它会改增益，干扰项目自己的电平统计与 VAD 噪声底。
             auto_gain_control=False,
-            stream_delay_ms=cfg.aec_stream_delay_ms,
+            # ⚠️ 恒为 0：far 参考已在下面往前读 150ms 做过物理对齐，
+            # 对齐后残余延迟 ≈0 —— 这里再给 150 = 补偿两次 → ERLE 39 dB 掉到 1 dB。
+            stream_delay_ms=0,
         )
         self._delay_frames = int(cfg.aec_stream_delay_ms / 1000.0 * 44100)
         self._far_read = 0                   # 最近一次用的 far 读位置（仅用于观测）
@@ -63,6 +65,20 @@ class AecGate:
         #    锚定之后最坏只是**瞬时**偏移（AEC3 的 delay estimator 能吸收），
         #    不会长期失准。
         # 稳态下两者等价：近端每 100ms 一块 → 播放也正好推进 4410 帧。
+        # ⚠️⚠️ **这里的偏移和 `stream_delay_ms` 是同一个延迟，只能补一次。**
+        #
+        # 离线实测（`tmp/verify_delay.py`，真实回声延迟 150ms）：
+        #   far 偏移 −150 + stream_delay 150 → **1.04 dB** ❌ ← 曾经的配置（补了两次）
+        #   far 偏移 −150 + stream_delay   0 → **39.09 dB** ✅ ← 现在
+        #   far 偏移    0 + stream_delay 任意 → 39 dB（**但生产不可达**：far 镜像是
+        #       回调写的，只有**已播出**的帧 —— 读 `emit_frames()` 等于读未来，恒空）
+        #
+        # 物理上：麦克风里的回声来自 ~150ms 前播出的音频，所以参考必须**往前读**
+        # 150ms 才能对齐。对齐之后 AEC3 面对的残余延迟 ≈0，**所以 `stream_delay_ms`
+        # 必须是 0（= 让它自估）**。给它 150 等于让它再找 150ms，直接失效。
+        #
+        # 历史：偏移本身是对的，错的是我同时把 `stream_delay_ms` 也设成 150。
+        # OCR 代码审查在 `aec.py:66` 独立指出「延迟被补偿了两次」。
         target = max(0, self.player.emit_frames() - self._delay_frames)
         self._far_read = target
 

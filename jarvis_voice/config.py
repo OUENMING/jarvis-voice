@@ -116,7 +116,16 @@ class Config:
     audio_mode: str = "headphones"
 
     # ---- AEC（仅 audio_mode == "speaker_aec" 生效）----
-    # 延迟粗值即可 —— AEC3 自带 delay estimator，实测 0 与 100 无差别。
+    # ⚠️ 这是「far 参考要往前读多少」，**不是**给 AEC3 的 `stream_delay_ms` 提示。
+    # 麦克风里的回声来自 ~150ms 前播出的音频 → 参考必须往前读这么久才算对齐。
+    # （`AecGate` 里给 `AudioProcessor` 的 `stream_delay_ms` 恒为 **0**：
+    #   对齐之后 AEC3 面对的残余延迟 ≈0，让它自估。两边都给 150 = **补偿两次**。）
+    #
+    # 离线实测（真实回声延迟 150ms，`tmp/verify_delay.py`）：
+    #   far 偏移 −150 + stream_delay 150 → **1.04 dB** ❌ ← 曾经的配置
+    #   far 偏移 −150 + stream_delay   0 → **39.09 dB** ✅
+    #   far 偏移    0（读未来，镜像是空的）→ 生产不可达
+    # OCR 代码审查在 `aec.py:66` 独立指出「延迟被补偿了两次」。
     aec_stream_delay_ms: int = 150
     # 注：`RESEARCH-AEC-20260919.md` §2.3 的三层防线（播放期间抬高 SNR 门限 /
     # speech_probability 双确认）**尚未实现** —— 那两个阈值没有实测数据可依据，
