@@ -82,6 +82,7 @@ def make_orch(fc, bus):
     o.session = Session()
     o._filler_lock = threading.Lock()
     o._filler_played_turn = None
+    o._filler_last_at = 0.0
     o._filler_timer = None
     o.log = lambda *a, **k: None
     return o
@@ -130,17 +131,33 @@ def main():
     d = fc2.pick("notes")[1]
     check("单条池仍能返回", (c, d), ("我翻下笔记。", "我翻下笔记。"))
 
-    print("\n=== ③ 同一轮只播一次（red-green 关键用例）===")
+    print("\n=== ③ 同一轮内不能连着播（时间门，不是「一轮一次」）===")
     fc3 = make_clips(tmp)
     o = make_orch(fc3, bus)
     turn = o.session.begin_turn()
     o.session.set_state(State.THINKING)
     check("首次 _play_filler 播了", o._play_filler(turn, "search", "tool"), True)
-    check("同一轮第二次是 no-op", o._play_filler(turn, "search", "tool"), False)
+    check("紧接着再播是 no-op", o._play_filler(turn, "search", "tool"), False)
     check("同一轮换个 trigger 也是 no-op",
           o._play_filler(turn, "", "latency"), False)
     check("播放器只收到 1 段", len(o.player.written), 1)
     check("发了 filler 事件", len([e for e in bus.events if e[0] == "filler"]), 1)
+
+    print("\n=== ③b 🆕 隔够久之后**允许**同一轮再播一条（真机修的正是这个）===")
+    print("   （真机：兜底 2.0s 播了「嗯……」，而第一个工具事件中位 3.4s 才到 ——")
+    print("     「一轮一条」会让按工具类别选的承接句**永远没机会**）")
+    o2 = make_orch(make_clips(tmp), FakeBus())
+    t2 = o2.session.begin_turn()
+    o2.session.set_state(State.THINKING)
+    check("先播兜底（通用池）", o2._play_filler(t2, "", "latency"), True)
+    o2._filler_last_at -= (o2.cfg.filler_min_gap_ms / 1000.0 + 0.1)   # 把时钟往前拨 1.6s
+    check("隔够久 → 承接句能播", o2._play_filler(t2, "search", "tool"), True)
+    check("两段都真播出去了", len(o2.player.written), 2)
+    _sp = o2.echo_guard._spoken[-1]
+    # ⚠️ `_spoken` 里存的是**归一化后**的文本（`echoguard.normalize` 去标点），
+    # 所以是「我搜一下」不是「我搜一下。」
+    check("第二条来自 search 池（不是通用池）",
+          _sp[1] in ("我搜一下", "我查一下"), True)
 
     print("\n=== ③ 新的一轮可以再播 ===")
     turn2 = o.session.begin_turn()

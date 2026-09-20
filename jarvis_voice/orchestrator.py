@@ -144,6 +144,9 @@ class Orchestrator:
         self._yield_turn: int | None = None
         self._yield_count = 0
         self._yield_lock = threading.Lock()
+        # 上一条填充音/承接句的**时刻**（时间门用，见 `filler_min_gap_ms`）。
+        # 0.0 = 还没播过（第一次一定放行）。
+        self._filler_last_at = 0.0
         # 「非应答轮」= CC 自己起的轮次（后台任务跑完后的汇报）。见 docs/WORKORDER-ASYNC-01.md
         self._async_pending: list[str | None] = []   # 攒着的句子；None = 该轮结束哨兵
         self._async_turn: int | None = None          # 我们给自主轮分配的 turn id
@@ -412,6 +415,12 @@ class Orchestrator:
                         if (prev_silence is None
                                 or (now - prev_silence) * 1000 >= self.cfg.interrupt_min_gap_ms):
                             burst_started_at = now
+                            # 🆕 观测：**武装**也记一条。用户报「要喊几遍才打断」时，
+                            # 这条能立刻区分两种原因：
+                            #   有 `[打断-武装]` 但没有 `[打断-触发]` → 卡在确认窗
+                            #   连 `[武装]` 都没有 → 卡在**静音门槛**（说得太密没静够）
+                            _gap = -1.0 if prev_silence is None else (now - prev_silence) * 1000
+                            self.log(f"🎤 [打断-武装] state={st.value} 前静 {_gap:.0f}ms")
                     elif (self.cfg.barge_in          # 免提模式：不做自动打断
                           and st is not State.IDLE
                           and not fired_for_this_speech
@@ -768,14 +777,21 @@ class Orchestrator:
         """真正播一条。返回是否播了。
 
         三重校验（原来写在 `_arm_filler.fire()` 里，tool 路径也要用，所以抽出来）：
-        **还是这一轮 + 还在思考 + 本轮一次都还没出过声**。
-        第三条靠 `_filler_played_turn` 保证（tool 路径与兜底定时器会同时扑过来）。
+        **还是这一轮 + 还在思考 + 距上一条够久**。
+        第三条原本是「本轮一条都没播过」，2026-09-20 真机改成**时间门** ——
+        因为兜底（2.0s）总抢在第一个工具事件（中位 3.4s）之前，
+        「一轮一条」会让按工具类别选的承接句**永远没机会**。见 `filler_min_gap_ms`。
         """
         if not (self.fillers and self.fillers.ready()):
             return False
         with self._filler_lock:
-            if self._filler_played_turn == turn:
+            now = time.time()
+            # ⚠️ 门**只在同一轮内**生效（`_filler_played_turn == turn`）——
+            # 换了一轮就是新语境（用户又说了一句），不该被上一轮的播放时刻卡住。
+            if (self._filler_played_turn == turn
+                    and now - self._filler_last_at < self.cfg.filler_min_gap_ms / 1000.0):
                 return False
+            self._filler_last_at = now
             self._filler_played_turn = turn
         if not self.session.is_current(turn) or self.session.state is not State.THINKING:
             with self._filler_lock:
@@ -784,6 +800,7 @@ class Orchestrator:
                 # 还能再播一次填充音，"同一轮只播一次"的保证就破了。
                 if self._filler_played_turn == turn:
                     self._filler_played_turn = None
+                    self._filler_last_at = 0.0     # 没真播，时间门也不该推进
             return False
         clip, text = self.fillers.pick(tag)
         if not clip:
