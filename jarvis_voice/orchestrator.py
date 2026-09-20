@@ -123,6 +123,8 @@ class Orchestrator:
         self.fillers = FillerClips(make_tts(cfg)) if cfg.filler_enabled else None
         self._filler_timer: threading.Timer | None = None
         self._hd_gated = False             # 半双工门控：正在因为"自己在播"而不听
+        self._last_rejected = 0            # vad.rejected 的上次值（只在变化时上报，见主循环）
+
         self._shutdown_started = False     # 关机按钮防重复触发
         self._threads: list[threading.Thread] = []
 
@@ -321,6 +323,17 @@ class Orchestrator:
                     self._hd_gated = False
                     self.vad.reset()          # 重新干净地开始听
                 utts = self.vad.accept(chunk)
+                # ---- 观测：SNR 门限丢了多少段（**这是「要很大声才能打断」的盲区**）----
+                # 段被 `vad._passes_gate` 丢掉时是**完全静默**的，不分播放中还是空闲。
+                # 播放期间丢 = 可能正是主人在插话却被门限吃掉 → 打断失灵。
+                # 只在计数变化时报（低频），并标明当时是否在播放。
+                if self.vad.rejected != self._last_rejected:
+                    d = self.vad.rejected - self._last_rejected
+                    self._last_rejected = self.vad.rejected
+                    self.log(f"[drop] SNR 门限丢了 {d} 段"
+                             f"（累计 {self.vad.rejected}）"
+                             f"{'  ⚠️ 当时正在播放' if self.player.is_playing() else ''}"
+                             f" | 噪声底={self.vad._floor:.5f}")
                 if self._paused.is_set():
                     continue      # 暂停：丢弃语音，也不触发打断（麦克风仍读，防设备缓冲溢出）
                 for utt in utts:
@@ -633,6 +646,10 @@ class Orchestrator:
         if self._paused.is_set():
             return          # 暂停期间不处理（麦克风侧也在丢弃）
         if len(utt) / self.cfg.sample_rate < self.cfg.asr_min_utt_sec:
+            # ⚠️ 这里是**静默丢弃** —— 以前丢了什么都不说，所以「说了助手没反应」
+            # 这类现象无法从日志定位。报出来（带时长），让失败可见。
+            self.log(f"[drop] 段太短 {len(utt)/self.cfg.sample_rate:.2f}s "
+                     f"< asr_min_utt_sec={self.cfg.asr_min_utt_sec}s → 丢弃")
             return
         r = self.asr.transcribe(utt)
         if not r.text:
