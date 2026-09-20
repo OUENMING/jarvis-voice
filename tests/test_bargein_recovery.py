@@ -111,11 +111,24 @@ class FakeBus:
         self.events.append((kind, kw))
 
 
+class FakeTrace:
+    """诊断轨迹的替身 —— P1 会在关键点落盘，测试里不碰真实文件。"""
+    def __init__(self):
+        self.dumps = []
+
+    def note(self, *a, **k):
+        pass
+
+    def dump(self, reason, **extra):
+        self.dumps.append(reason)
+
+
 def make_orch(player=None):
     o = object.__new__(O.Orchestrator)
     o.cfg = Config.load()
     o.session = Session()
     o.player = player or make_player()
+    o.trace = FakeTrace()
     o.log = lambda *a, **k: None
     o._pending_bargein_at = None
     o._filler_timer = None

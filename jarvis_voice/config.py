@@ -232,6 +232,14 @@ class Config:
     turn_yield_ms: int = 0        # 0 = 关
     turn_yield_after_sentences: int = 2   # 第几句之后停（只停这一次，不是每句都停）
 
+    # ---- 打断诊断轨迹（`~/.jarvis/bargein-trace.jsonl`）----
+    # 常驻记录麦克风级别 + VAD 状态，**只在关键时刻落盘**（播放中检测到语音 /
+    # 武装 / 待定 / 撤回 / 提交 / 超时）。平时零盘 IO。
+    # 为什么需要：`level` 是瞬时事件**不落盘**，所以「那一刻麦克风多响、
+    # VAD 有没有翻」在事后完全看不到 —— 而那正是判断"打断为什么不灵"的唯一依据。
+    # 关掉：`JARVIS_BARGEIN_TRACE=0`。
+    bargein_trace: bool = True
+
     # ---- 回声文本护栏（装 AEC 之前的纯文本兜底，零延迟）----
     # 动机：内置扬声器 + 内置麦时，AEC 残余会越过 VAD 门限被转写；若进了脑，
     # 助手就会**回应自己**（HANDOVER §1 明确列为不可接受："不能凭空自言自语"）。
@@ -362,6 +370,7 @@ class Config:
             turn_yield_ms=_env_int("JARVIS_TURN_YIELD_MS", cls.turn_yield_ms),
             turn_yield_after_sentences=_env_int("JARVIS_TURN_YIELD_AFTER",
                                                 cls.turn_yield_after_sentences),
+            bargein_trace=os.environ.get("JARVIS_BARGEIN_TRACE", "1") == "1",
             resume_session=os.environ.get("JARVIS_RESUME") == "1",
             persona_file=_env_str("JARVIS_PERSONA", str(JARVIS_HOME / "persona.md")),
             memory_file=_env_str("JARVIS_MEMORY", str(JARVIS_HOME / "memory.md")),

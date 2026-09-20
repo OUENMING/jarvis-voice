@@ -25,6 +25,7 @@ from claude_bridge import ClaudeBridge
 from .asr import make_asr
 from .aec import AecGate
 from .audio_io import MicStream, resolve_device
+from .bargein_trace import BargeinTrace
 from .config import JARVIS_HOME, Config
 from .commands import match as match_meta
 from .echoguard import EchoGuard, similarity
@@ -147,6 +148,10 @@ class Orchestrator:
         # 上一条填充音/承接句的**时刻**（时间门用，见 `filler_min_gap_ms`）。
         # 0.0 = 还没播过（第一次一定放行）。
         self._filler_last_at = 0.0
+        # 诊断轨迹（常驻记录电平 + VAD 状态，只在关键时刻落盘）。
+        # 纯观测，不影响行为；写盘失败一律吞掉。见 bargein_trace.py。
+        self.trace = BargeinTrace(enabled=cfg.bargein_trace)
+        self._trace_onset_done = False     # 一次「开口」只落一次盘
         # 「非应答轮」= CC 自己起的轮次（后台任务跑完后的汇报）。见 docs/WORKORDER-ASYNC-01.md
         self._async_pending: list[str | None] = []   # 攒着的句子；None = 该轮结束哨兵
         self._async_turn: int | None = None          # 我们给自主轮分配的 turn id
@@ -322,6 +327,10 @@ class Orchestrator:
         self.log(f"       AEC = {'开' if self.aec is not None else '关'}"
                  f" | far 读偏移 = {self.cfg.aec_stream_delay_ms}ms"
                  f" | VAD 预滚 = {self.cfg.vad_pre_roll_ms}ms")
+        # 诊断轨迹落在哪 —— 用户报「打断不灵」时要看这个文件，不打出来就找不到
+        if self.trace.enabled:
+            self.log(f"       打断诊断轨迹 → {self.trace.path}"
+                     f"（平时零盘 IO，只在播放中检测到语音/武装/待定/撤回/提交时落盘）")
         burst_started_at: float | None = None   # 本次"语音爆发"的起点
         fired_for_this_speech = False
         silence_since: float | None = None      # 当前静音段从何时开始（None = 正在说话）
@@ -344,10 +353,14 @@ class Orchestrator:
                 aec = self.aec
                 if aec is not None:
                     chunk = aec.accept(chunk)
+                # ⚠️ RMS **每块都算一次**：下面电平表是节流的（~12 次/秒），
+                # 但诊断轨迹要每块都记（10 次/秒，与块长对齐），所以提到节流之外。
+                # 1600 个 float 的 RMS ≈ 微秒级，主循环块预算是 100ms，可以忽略。
+                chunk_rms = float(np.sqrt(np.mean(np.square(chunk))))
                 # 麦克风电平（仪表盘电平表），节流 ~12 次/秒
                 now = time.time()
                 if now - last_level > 0.08:
-                    rms = float(np.sqrt(np.mean(np.square(chunk))))
+                    rms = chunk_rms
                     if aec is not None:
                         # 播放期间多报一个 WebRTC 自己的语音概率 ——
                         # 留着事后定 aec_min_speech_prob 的阈值（先测量，再设门限）。
@@ -403,24 +416,37 @@ class Orchestrator:
                 st = self.session.state
                 speaking = self.vad.speaking
                 now = time.time()
+                # 诊断轨迹：**每块都记**（10 次/秒，只进内存环形缓冲，不碰盘）。
+                # 为什么值得常驻：用户报「要喊几遍才打断」时，最该看的那个数
+                # （那一刻麦克风多响、VAD 有没有翻）在 events.jsonl 里**没有留痕**
+                # —— `level` 被刻意标成瞬时事件不落盘。见 bargein_trace.py。
+                self.trace.note(chunk_rms, speaking, self.player.is_playing())
                 if not speaking:
                     if silence_since is None:
                         silence_since = now
                     burst_started_at = None              # 爆发结束
                     fired_for_this_speech = False
+                    self._trace_onset_done = False       # 下一次开口可以再落一次盘
                 else:
                     silence_since = None
                     if burst_started_at is None:
                         # 只有"静够久之后"的新爆发才武装；否则视为同一次说话的延续
-                        if (prev_silence is None
-                                or (now - prev_silence) * 1000 >= self.cfg.interrupt_min_gap_ms):
+                        # 🆕 观测：**武装**也记一条。用户报「要喊几遍才打断」时，
+                        # 这条能立刻区分两种原因：
+                        #   有 `[打断-武装]` 但没有 `[打断-触发]` → 卡在确认窗
+                        #   连 `[武装]` 都没有 → 卡在**静音门槛**（说得太密没静够）
+                        _gap = -1.0 if prev_silence is None else (now - prev_silence) * 1000
+                        _armed = _gap < 0 or _gap >= self.cfg.interrupt_min_gap_ms
+                        if _armed:
                             burst_started_at = now
-                            # 🆕 观测：**武装**也记一条。用户报「要喊几遍才打断」时，
-                            # 这条能立刻区分两种原因：
-                            #   有 `[打断-武装]` 但没有 `[打断-触发]` → 卡在确认窗
-                            #   连 `[武装]` 都没有 → 卡在**静音门槛**（说得太密没静够）
-                            _gap = -1.0 if prev_silence is None else (now - prev_silence) * 1000
                             self.log(f"🎤 [打断-武装] state={st.value} 前静 {_gap:.0f}ms")
+                        # 🆕 **这就是"用户在试图打断"的定义** —— 播放中 VAD 说有人说话。
+                        # 无论武装没武装、成没成，都落一次盘（每次开口只落一次）。
+                        if self.player.is_playing() and not self._trace_onset_done:
+                            self._trace_onset_done = True
+                            self.trace.dump("speech_during_playback",
+                                            state=st.value, armed=_armed,
+                                            gap_ms=round(_gap))
                     elif (self.cfg.barge_in          # 免提模式：不做自动打断
                           and st is not State.IDLE
                           and not fired_for_this_speech
@@ -446,6 +472,7 @@ class Orchestrator:
                         self.player.resume()
                     else:
                         self.log(f"⚡ [打断-超时] {self.cfg.bargein_grace_ms}ms 内没有转写 → 提交")
+                        self.trace.dump("timeout", state=st.value)
                         self._commit_interrupt()
                 prev_silence = silence_since if silence_since is not None else prev_silence
         except KeyboardInterrupt:
@@ -466,6 +493,7 @@ class Orchestrator:
         self.player.pause()
         self.log(f"⚡ [打断-待定] 已暂停，等 {self.cfg.bargein_grace_ms}ms 内的转写判断")
         BUS.emit("bargein_pending", grace_ms=self.cfg.bargein_grace_ms)
+        self.trace.dump("bargein_pending", grace_ms=self.cfg.bargein_grace_ms)
 
     def _resolve_bargein(self, text: str, is_echo: bool = False):
         """转写到了（或为空）→ 判定刚才是误判还是真打断。**没有待决窗口时是 no-op。**
@@ -483,8 +511,13 @@ class Orchestrator:
             self.log(f"↩️ [打断-撤回] {waited:.0f}ms 后判为误判（{why}：{text!r}）→ 接着播")
             BUS.emit("bargein_reverted", text=text, waited_ms=round(waited),
                      reason=why)
+            # ⚠️ 这里的 kwarg 不能叫 `reason` —— `dump(reason, **extra)` 的**第一个形参**
+            # 就叫这个名，重名会 `TypeError: got multiple values for argument 'reason'`。
+            # （测试抓到的；生产里同样会炸。）
+            self.trace.dump("revert", text=text[:40], waited_ms=round(waited), why=why)
             return
         self.log(f"⚡ [打断-确认] {waited:.0f}ms 后判为真打断（{text[:24]!r}）")
+        self.trace.dump("commit", text=text[:40], waited_ms=round(waited))
         self._commit_interrupt()
 
     def _do_interrupt(self):
