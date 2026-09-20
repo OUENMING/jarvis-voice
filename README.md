@@ -145,11 +145,18 @@ git clone https://github.com/OUENMING/jarvis-voice.git
 cd jarvis-voice
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
-# 2. 模型（230MB，不入库）
-#    从 k2-fsa/sherpa-onnx 的 releases 下载，放进 models/：
-#      models/vad/silero_vad.onnx
-#      models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/
-mkdir -p models/vad
+# 2. 模型（230MB，不入库）—— 从 k2-fsa/sherpa-onnx 的 asr-models release 拿
+mkdir -p models && cd models
+curl -SL -O https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2
+tar xvf sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2
+rm sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2
+#    代码读的是 model.int8.onnx（239MB）。包解出来的目录名带 -int8-，默认路径不带，
+#    所以要么改名（下面这句），要么设 JARVIS_ASR_MODEL 指过去。
+mv sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17 \
+   sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17
+mkdir -p vad && curl -SL -o vad/silero_vad.onnx \
+   https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx
+cd ..
 
 # 3. 凭据与个人数据（都不入库，放 ~/.jarvis/）
 mkdir -p ~/.jarvis
@@ -157,7 +164,15 @@ echo 'FISH_API_KEY=你的key' > ~/.jarvis/fish.env && chmod 600 ~/.jarvis/fish.e
 #    persona.md —— 人工维护的"身份与世界事实"，脑开机就读它。不写也能跑，只是它不认识你
 #    memory.md  —— 说「记住 X」时自动追加；不建会自动跳过
 
-# 4. 跑
+# 4. MCP —— 「查资料 / 开网页」全靠它，不配就只有 Bash/Edit/Read
+cp mcp-jarvis.example.json mcp-jarvis.local.json   # 这个文件名已在 .gitignore 里
+#    填 key 后，三个 server 按需取舍：
+#      tavily        搜索（https://tavily.com 拿 key）
+#      browser       浏览器自动化（本项目用的是 claude-code-browser，需填绝对路径）
+#      obsidian-vault 第二大脑（Obsidian 得开着，token 在 Local REST API 插件里）
+#    也可用 JARVIS_MCP_CONFIG=<路径> 指到别处。
+
+# 5. 跑
 ./jarvis.sh start --dashboard      # 耳机模式 + 仪表盘 http://127.0.0.1:8848
 ```
 

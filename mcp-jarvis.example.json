@@ -1,4 +1,6 @@
 {
+  "_说明": "复制成 mcp-jarvis.local.json 再填 key（那个文件名已在 .gitignore 里）。也可用 JARVIS_MCP_CONFIG 指到别处。",
+  "_注意": "只挂需要的。每挂一个 server 就多一份启动握手开销（常驻进程只在启动时握一次）。挂多了会拖慢启动。",
   "mcpServers": {
     "tavily": {
       "type": "http",
@@ -8,7 +10,7 @@
       "type": "stdio",
       "command": "node",
       "args": [
-        "/Users/owen/WorkBuddy/claude-code-browser/mcp-server/index.js"
+        "/绝对路径/到/claude-code-browser/mcp-server/index.js"
       ],
       "env": {}
     },
