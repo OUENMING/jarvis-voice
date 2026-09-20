@@ -934,6 +934,11 @@ class Orchestrator:
         if self.session.state is not State.IDLE or self._pending_bargein_at is not None:
             try:
                 self._trace_utt_path = self.trace.save_pcm(utt, "bargein")
+                # 🆕 同时存一份**未过 AEC** 的原始近端 —— 同一时间窗的前后对照。
+                # 真机观测到打断时高频被削 4-5 倍，但成因有两类（AEC 压近端 vs
+                # 麦+距离本身丢高频），**修法完全不同**，只能靠这个 A/B 分开。
+                if self.aec is not None:
+                    self.trace.save_pcm(self.aec.raw_slice(len(utt)), "bargein-raw")
             except Exception:
                 self._trace_utt_path = None
         r = self.asr.transcribe(utt)

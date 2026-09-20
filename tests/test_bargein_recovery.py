@@ -217,6 +217,57 @@ pq3 = make_player()
 pq3._mirror_far(np.zeros(4410, dtype=np.int16))
 check("静音 → 0", pq3.far_rms(4410), 0.0)
 
+print("\n=== ⑪ `AecGate.raw_slice()`：AEC **之前**的原始近端（诊断 A/B 用）===")
+print("   （真机高频被削 4-5 倍，但要分清是 AEC 压的、还是麦+距离本身丢的 ——")
+print("     两者的修法完全不同，只能靠同一句的 AEC 前后对照）")
+from jarvis_voice.aec import AecGate                            # noqa: E402
+g = object.__new__(AecGate)
+g.rate = 16000
+g._raw_cap = 16000 * 30
+g._raw = np.zeros(g._raw_cap, dtype=np.int16)
+g._raw_w = 0
+g.fed = 0
+
+
+def feed_raw(gate, arr):
+    """复刻 accept() 里写原始环的那段（不跑 AEC，避免造 AudioProcessor）。"""
+    n = arr.shape[0]
+    if n >= gate._raw_cap:
+        gate._raw[:] = arr[-gate._raw_cap:]
+        gate._raw_w = 0
+    else:
+        end = gate._raw_w + n
+        if end <= gate._raw_cap:
+            gate._raw[gate._raw_w:end] = arr
+        else:
+            k = gate._raw_cap - gate._raw_w
+            gate._raw[gate._raw_w:] = arr[:k]
+            gate._raw[:end - gate._raw_cap] = arr[k:]
+        gate._raw_w = end % gate._raw_cap
+    gate.fed += n
+
+
+a = np.arange(1, 3001, dtype=np.int16)
+feed_raw(g, a)
+# ⚠️ 用 (首, 尾, 和) 比较，别打印整个数组（会把日志刷爆）
+def sig(v):
+    return (int(v[0]), int(v[-1]), int(v.sum())) if v.size else None
+check("取最近 100 个 = 尾部", sig(g.raw_slice(100)), sig(a[-100:]))
+check("取全部", sig(g.raw_slice(3000)), sig(a))
+check("取 0 个 → 空", g.raw_slice(0).size, 0)
+check("请求超过已喂的量也不会越界", g.raw_slice(10**6).size, 3000)
+# 灌超过容量的数据，验证环形回绕（⚠️ 容量和底层数组要一起改）
+g._raw_cap = 1000
+g._raw = np.zeros(1000, dtype=np.int16)
+g._raw_w = 0
+g.fed = 0
+for _ in range(5):
+    feed_raw(g, np.arange(1000, 2000, dtype=np.int16))
+check("回绕后仍是最近 1000 个", sig(g.raw_slice(1000)),
+      sig(np.arange(1000, 2000, dtype=np.int16)))
+check("回绕后取最近 10 个", sig(g.raw_slice(10)),
+      sig(np.arange(1990, 2000, dtype=np.int16)))
+
 O.BUS = O.__dict__.get("_REAL_BUS", None) or __import__("jarvis_voice.events", fromlist=["BUS"]).BUS
 
 print()

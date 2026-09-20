@@ -47,6 +47,16 @@ class AecGate:
         self._delay_frames = int(cfg.aec_stream_delay_ms / 1000.0 * 44100)
         self._far_read = 0                   # 最近一次用的 far 读位置（仅用于观测）
         self.fed = 0                         # 喂进去的近端样本数（可观测）
+        # 🆕 **原始麦克风**（未过 AEC）的环形缓冲，只用于诊断 A/B。
+        # 为什么要它：真机观测到「打断时说的话高频被削 4-5 倍」，但**成因有两类**——
+        #   ① AEC 在双讲时压近端（可离线复现：4-8k 掉 5.7×）
+        #   ② 笔记本麦 + 距离本身就丢高频（物理原因）
+        # 两者的修法完全不同，只能靠**同一句的 AEC 前后对照**分开。
+        # ⚠️ 近端不过重采样（进出都是 16k 等长），所以原始流与输出流**同时钟同长度**，
+        #    取"最近 N 个样本"就是同一时间窗，不需要额外的位置映射。
+        self._raw_cap = self.rate * 30       # 留 30s 够用
+        self._raw = np.zeros(self._raw_cap, dtype=np.int16)
+        self._raw_w = 0
 
     # ---- 主入口 ----
     def accept(self, chunk_f32: np.ndarray) -> np.ndarray:
@@ -98,6 +108,20 @@ class AecGate:
         self._far_read += need44
 
         near_i16 = np.clip(chunk_f32 * INT16, -INT16, INT16 - 1).astype(np.int16)
+        # 存原始近端（诊断用，见 __init__ 的说明）。O(1)，无分配。
+        n = near_i16.shape[0]
+        if n >= self._raw_cap:
+            self._raw[:] = near_i16[-self._raw_cap:]
+            self._raw_w = 0
+        else:
+            end = self._raw_w + n
+            if end <= self._raw_cap:
+                self._raw[self._raw_w:end] = near_i16
+            else:
+                k = self._raw_cap - self._raw_w
+                self._raw[self._raw_w:] = near_i16[:k]
+                self._raw[:end - self._raw_cap] = near_i16[k:]
+            self._raw_w = end % self._raw_cap
         far_i16 = np.clip(far16 * INT16, -INT16, INT16 - 1).astype(np.int16)
         clean = self.ap.process(near_i16, far_i16)
         self.fed += n16
@@ -112,7 +136,21 @@ class AecGate:
         except Exception:
             return 0.0
 
+    def raw_slice(self, n: int) -> np.ndarray:
+        """最近 n 个**未过 AEC**的原始近端样本（诊断 A/B 用）。
+
+        ⚠️ 近端不过重采样、进出等长 → 原始流与输出流同时钟同长度，
+        所以"最近 n 个"就是与 AEC 输出同一时间窗，不需要位置映射。
+        """
+        n = max(0, min(int(n), self._raw_cap, self.fed))
+        if n == 0:
+            return np.zeros(0, dtype=np.int16)
+        idx = (self._raw_w - n + np.arange(n)) % self._raw_cap
+        return self._raw[idx].copy()
+
     def reset(self):
         """切模式 / 换设备时调 —— AEC 内部状态重来（读指针每次都是从播放时钟算的）。"""
         self.ap.reset()
+        self._raw[:] = 0
+        self._raw_w = 0
         self._far_read = 0
