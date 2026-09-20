@@ -58,7 +58,7 @@ check("样本数 = 喂进去的条数", len(s), 30)
 check("最后一条 dt=0（= 落盘那一刻）", s[-1][0], 0)
 check("时间**非递减**（连调会落在同一毫秒，所以不能要求严格递增）",
       all(s[i][0] <= s[i + 1][0] for i in range(len(s) - 1)), True)
-check("每条 4 个字段", all(len(x) == 4 for x in s), True)
+check("每条 5 个字段 [dt, rms, speaking, playing, far_rms]", all(len(x) == 5 for x in s), True)
 check("speaking 是 0/1", set(x[2] for x in s), {0, 1})
 check("rms 放大成整数（省空间）", all(isinstance(x[1], int) for x in s), True)
 check("最后一条的 speaking=1（i>20 都算说话）", s[-1][2], 1)
@@ -111,6 +111,41 @@ _first = [json.loads(x)["reason"] for x in open(p6 + ".1") if x.strip()]
 _now = [json.loads(x)["reason"] for x in open(p6) if x.strip()]
 check("旧的挪进了 .1", _first, ["first"])
 check("新的留在主文件", _now, ["second"])
+
+print("\n=== ⑨ `save_pcm`：把打断那段音频存下来（供离线复听/重转写）===")
+import numpy as np                                            # noqa: E402
+import glob as _glob                                          # noqa: E402
+import wave as _wave                                          # noqa: E402
+t7, p7 = new("trace.jsonl")
+pcm = (np.sin(np.arange(16000) / 40.0) * 8000).astype(np.int16)
+saved = t7.save_pcm(pcm, "bargein")
+check("返回了路径", bool(saved), True)
+check("文件真的存在", os.path.exists(saved or ""), True)
+with _wave.open(saved, "rb") as w:
+    check("采样率 16k", w.getframerate(), 16000)
+    check("单声道 int16", (w.getnchannels(), w.getsampwidth()), (1, 2))
+    check("样本数对得上", w.getnframes(), 16000)
+    check("内容一致（不是空文件）", w.readframes(16000)[:200] not in (b"\x00" * 200, ""), True)
+check("目录是 trace 同级的 bargein-audio/",
+      os.path.basename(os.path.dirname(saved or "")), "bargein-audio")
+
+print("\n=== ⑨b 关闭时不存 ===")
+t8, _ = new("t8.jsonl")
+t8.enabled = False
+check("返回 None", t8.save_pcm(pcm, "x"), None)
+
+print("\n=== ⑨c 只保留最近 _KEEP 个（别把磁盘塞满）===")
+import jarvis_voice.bargein_trace as B2                       # noqa: E402
+t9, p9 = new("t9.jsonl")
+old_keep = B2._KEEP
+B2._KEEP = 3
+try:
+    for i in range(6):
+        t9.save_pcm(pcm, f"k{i}")
+finally:
+    B2._KEEP = old_keep
+left = _glob.glob(os.path.join(os.path.dirname(p9), "bargein-audio", "*.wav"))
+check("只剩 3 个", len(left), 3)
 
 print()
 if FAIL:

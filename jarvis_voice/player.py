@@ -256,6 +256,35 @@ class Player:
             out[k:] = self._far[:n - k]
             return out
 
+    def far_rms(self, n_frames: int) -> float:
+        """最近 n 帧 far 参考的 RMS（归一化到 1.0）。
+
+        用途：**算真实房间里的 ERLE** —— 与麦克风侧的 RMS 一起记进诊断轨迹，
+        `ERLE = 20log10(far_rms / mic_rms)`（只在"没人在说话"的时段取）。
+        为什么要它：离线探针报的 34–36 dB 是**探针环境**的数；真机里扬声器音量、
+        麦的位置、回声延迟都可能不同。打断识别差的时候，第一件要确认的就是
+        **AEC 在真机上到底还剩多少** —— 没有 far 电平就算不出来。
+
+        ⚠️ 读环**必须在锁内**，且片段先 copy 再算（回调同时在写）。
+        """
+        n = max(1, int(n_frames))
+        with self._far_lock:
+            end = self._far_w
+            start = max(0, end - n, end - self._far_cap)
+            if end <= start:
+                return 0.0
+            seg = self._far[start % self._far_cap:] if (start % self._far_cap) + (end - start) <= self._far_cap \
+                else None
+            if seg is None:
+                a = start % self._far_cap
+                k = self._far_cap - a
+                seg = np.concatenate([self._far[a:], self._far[:(end - start) - k]])
+            else:
+                seg = seg[:end - start].copy()
+        if seg.size == 0:
+            return 0.0
+        return float(np.sqrt(np.mean(np.square(seg.astype(np.float32)))) / 32768.0)
+
     def cut_tag(self, tag: str) -> float:
         """把缓冲里该标签的音频整段切掉，返回切掉的秒数。
 

@@ -152,6 +152,7 @@ class Orchestrator:
         # 纯观测，不影响行为；写盘失败一律吞掉。见 bargein_trace.py。
         self.trace = BargeinTrace(enabled=cfg.bargein_trace)
         self._trace_onset_done = False     # 一次「开口」只落一次盘
+        self._trace_utt_path: str | None = None   # 本次打断音频存到哪（存完置 None）
         # 「非应答轮」= CC 自己起的轮次（后台任务跑完后的汇报）。见 docs/WORKORDER-ASYNC-01.md
         self._async_pending: list[str | None] = []   # 攒着的句子；None = 该轮结束哨兵
         self._async_turn: int | None = None          # 我们给自主轮分配的 turn id
@@ -420,7 +421,18 @@ class Orchestrator:
                 # 为什么值得常驻：用户报「要喊几遍才打断」时，最该看的那个数
                 # （那一刻麦克风多响、VAD 有没有翻）在 events.jsonl 里**没有留痕**
                 # —— `level` 被刻意标成瞬时事件不落盘。见 bargein_trace.py。
-                self.trace.note(chunk_rms, speaking, self.player.is_playing())
+                #
+                # `far_rms` = 扬声器侧电平 → 有了它才能算**真实房间的 ERLE**：
+                # `20log10(far/mic)`（只在"没人在说话"的时段取）。离线探针报的
+                # 34–36 dB 是探针环境的数，真机可能完全不同 —— 打断识别差时
+                # 第一件要确认的就是这个。
+                _far = 0.0
+                if aec is not None:
+                    try:
+                        _far = self.player.far_rms(chunk.shape[0])
+                    except Exception:
+                        _far = 0.0          # 诊断量，取不到就算了
+                self.trace.note(chunk_rms, speaking, self.player.is_playing(), _far)
                 if not speaking:
                     if silence_since is None:
                         silence_since = now
@@ -916,7 +928,27 @@ class Orchestrator:
             self.log(f"[drop] 段太短 {len(utt)/self.cfg.sample_rate:.2f}s "
                      f"< asr_min_utt_sec={self.cfg.asr_min_utt_sec}s → 丢弃")
             return
+        # 诊断：这一句是**打断**来的吗？是就把音频存下来（事后能复听/重转写）。
+        # ⚠️ 判据要在 `_resolve_bargein` **之前**取 —— 它会把 `_pending_bargein_at` 清掉。
+        # `state != IDLE` 或"有待定窗口"都算打断：前者是它正在播/想，后者是刚起音。
+        if self.session.state is not State.IDLE or self._pending_bargein_at is not None:
+            try:
+                self._trace_utt_path = self.trace.save_pcm(utt, "bargein")
+            except Exception:
+                self._trace_utt_path = None
         r = self.asr.transcribe(utt)
+        # 诊断：这一句如果是**打断**来的（或刚在待定窗口），把音频存下来 ——
+        # 用户报「它一说话我打断识别就差」，光看电平只能猜到"有干扰"，
+        # **听到音频**才能分清是"用户声音被压/变形"还是"混进了残余回声"还是
+        # "段被截头去尾"。三种修法完全不同。
+        if self._trace_utt_path is not None:
+            try:
+                with open(self._trace_utt_path + ".txt", "w", encoding="utf-8") as f:
+                    f.write((r.text or "") + f"\n(ASR {r.latency_ms:.0f}ms)\n")
+            except OSError:
+                pass
+            self.log(f"[打断] 音频已存 {self._trace_utt_path}  转写={r.text!r}")
+            self._trace_utt_path = None
         # ---- 回声文本护栏 ----
         # 内置扬声器场景：AEC 残余越过 VAD 门限被转写。若放它进脑，助手就**回应自己**
         # （HANDOVER §1 的验收口径"不能凭空自言自语"）。放在**最前** ——

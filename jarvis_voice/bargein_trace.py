@@ -41,6 +41,7 @@ import json
 import os
 import threading
 import time
+import wave
 from collections import deque
 
 # 保留多久的轨迹（秒）。要够看清"从安静到开口"的整个过程。
@@ -49,6 +50,8 @@ _PRE_SEC = 15.0
 _SAMPLE_HZ = 10
 # 落盘上限：超过就轮转一次（保留一个 .1）。与 events.py 同款策略。
 MAX_BYTES = 4 * 1024 * 1024
+# 打断音频最多留几个（别把磁盘塞满）
+_KEEP = 60
 
 
 def _default_path() -> str:
@@ -66,14 +69,21 @@ class BargeinTrace:
         self._t0 = time.time()
         self.dumps = 0                    # 统计：落了几次（可观测）
 
-    def note(self, rms: float, speaking: bool, playing: bool) -> None:
-        """主循环每块调一次。只入内存，不碰盘。"""
+    def note(self, rms: float, speaking: bool, playing: bool,
+             far_rms: float = 0.0) -> None:
+        """主循环每块调一次。只入内存，不碰盘。
+
+        `far_rms` = **扬声器侧**（far 参考）的电平。有它才能算出**真实房间里的 ERLE**：
+        `20log10(far_rms / rms)`，只在"没人在说话"的时段取。离线探针报的 34–36 dB
+        是**探针环境**的数；真机里音量/麦位/回声延迟都可能不同，打断识别差时
+        第一件要确认的就是这个。
+        """
         if not self.enabled:
             return
         with self._lock:
             self._buf.append((round((time.time() - self._t0) * 1000.0),
                               int(min(rms, 1.0) * 10000), int(bool(speaking)),
-                              int(bool(playing))))
+                              int(bool(playing)), int(min(far_rms, 1.0) * 10000)))
 
     def dump(self, reason: str, **extra) -> str | None:
         """把前 `_PRE_SEC` 秒的轨迹整段落盘。返回文件路径（失败/关闭时 None）。
@@ -90,7 +100,7 @@ class BargeinTrace:
         rec = {"reason": reason, "t": round(time.time() - self._t0, 3), **extra}
         # 压成相对毫秒（相对本次落盘），比绝对时刻好读
         now = samples[-1][0]
-        rec["samples"] = [[ms - now, r, sp, pl] for ms, r, sp, pl in samples]
+        rec["samples"] = [[ms - now, r, sp, pl, fr] for ms, r, sp, pl, fr in samples]
         self.dumps += 1
         try:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
@@ -101,3 +111,39 @@ class BargeinTrace:
         except OSError:
             pass                          # ⚠️ 诊断工具绝不把主链路带崩
         return self.path
+
+    # ---- 打断音频落盘 ----
+    def save_pcm(self, pcm_int16, tag: str, sample_rate: int = 16000) -> str | None:
+        """把一段语音存成 wav，供事后**离线复听 / 重转写**。
+
+        为什么要它：用户报「它一说话我打断，识别就很差」。看电平只能猜到"有干扰"，
+        **听到那段音频**才能分清是下面哪一种 —— 三种的修法完全不同：
+          · 用户的声音被压低/变了形（AEC 双讲副作用）
+          · 混进了它自己的残余回声（回声没消干净）
+          · 段被截头去尾（ASR 缺前导上下文）
+
+        存到 `~/.jarvis/bargein-audio/`，只保留最近 `_KEEP` 个。
+        """
+        if not self.enabled or pcm_int16 is None:
+            return None
+        d = os.path.join(os.path.dirname(self.path), "bargein-audio")
+        try:
+            os.makedirs(d, exist_ok=True)
+            name = (f"{time.strftime('%H%M%S')}-"
+                    f"{int(time.time() * 1000) % 1000:03d}-{tag}.wav")
+            path = os.path.join(d, name)
+            with wave.open(path, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(sample_rate)
+                w.writeframes(bytes(pcm_int16))
+            # ⚠️ **先写后裁**（写之前裁会差一个：第 N 次写完后总数是 N，而不是 N-1）
+            old = sorted(f for f in os.listdir(d) if f.endswith(".wav"))
+            for f in old[:-_KEEP]:
+                try:
+                    os.unlink(os.path.join(d, f))
+                except OSError:
+                    pass
+            return path
+        except OSError:
+            return None

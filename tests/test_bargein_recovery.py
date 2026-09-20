@@ -200,6 +200,23 @@ check("立刻作废", o5.session.is_current(t5), False)
 check("立刻清缓冲", o5.player.buffered_seconds(), 0)
 check("不会留下待决窗口", o5._pending_bargein_at, None)
 
+print("\n=== ⑩ `far_rms()`：算真实房间 ERLE 的唯一来源（AEC 诊断要用）===")
+import numpy as np2                                          # noqa: E402
+pq = make_player()
+# 往 far 镜像里灌一段已知幅度的音频（模拟"扬声器正在出声"）
+amp = 32768 // 4                                             # 幅度 0.25
+block = np.full(4410, amp, dtype=np.int16)
+pq._mirror_far(block)
+got = pq.far_rms(4410)
+check("幅度约等于 0.25（±0.02）", abs(got - 0.25) < 0.02, True)
+check("空历史时返回 0", pq.far_rms(10) > 0, True)            # 刚写过，应当非 0
+pq2 = make_player()
+check("全新 player 的 far_rms 是 0（镜像全零）", pq2.far_rms(4410), 0.0)
+# 静音段应当算出 0 —— 这是"只在没播放时取 ERLE"的前提
+pq3 = make_player()
+pq3._mirror_far(np.zeros(4410, dtype=np.int16))
+check("静音 → 0", pq3.far_rms(4410), 0.0)
+
 O.BUS = O.__dict__.get("_REAL_BUS", None) or __import__("jarvis_voice.events", fromlist=["BUS"]).BUS
 
 print()
