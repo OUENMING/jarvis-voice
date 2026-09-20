@@ -48,8 +48,17 @@ class MicStream:
         self.q: queue.Queue[np.ndarray] = queue.Queue(maxsize=cfg.mic_queue_max)
         self._stream: sd.InputStream | None = None
         self.dropped = 0
+        self.status_flags = 0            # 采集侧回调状态异常次数（xrun/overflow）
+        self.last_status = ""            # 最近一次的 status 文本（排查用）
 
     def _cb(self, indata, frames, time_info, status):
+        # ⚠️ `status`（sounddevice 的 CallbackFlags，含 input overflow 等 xrun 信息）
+        # 原来**被完全忽略**（ocr 代码审查 2026-09-20 报的 `audio_io.py:52`）。
+        # 采集侧溢出与队列侧溢出（`dropped`）是**两回事** —— 不记这个就分不清
+        # 「系统没采上来」还是「我们消费跟不上」。低频事件，只累计计数。
+        if status:
+            self.status_flags += 1
+            self.last_status = str(status)
         chunk = indata[:, 0].copy()
         try:
             self.q.put_nowait(chunk)

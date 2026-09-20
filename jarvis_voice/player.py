@@ -96,6 +96,24 @@ class Player:
     def device(self):
         return self._device
 
+    @property
+    def output_latency_ms(self) -> float | None:
+        """sounddevice 实际报告的输出延迟（ms）。
+
+        ⚠️ 这是 **AEC 对齐里的未知量 B** —— 2026-09-20 之前**从没读过它**
+        （`grep latency player.py` 命中 0），所以 `aec_stream_delay_ms=150`
+        对不对一直是靠推断。把它暴露出来，B 就从「未知」变「已知」。
+        """
+        try:
+            lat = self._stream.latency if self._stream is not None else None
+            if lat is None:
+                return None
+            if isinstance(lat, (tuple, list)):
+                lat = lat[-1]                 # duplex 流派 (input, output)
+            return float(lat) * 1000.0
+        except Exception:
+            return None
+
     # ---- 回调（实时线程）----
     def _cb(self, outdata, frames, time_info, status):
         filled = 0
@@ -207,6 +225,13 @@ class Player:
         这里**没有"不读未来"这一条** —— 镜像里的每一帧都已经被扬声器播出去了
         （回调写的），所以镜像帧号 ≡ 播放位置 ≡ `_far_w`，三者同一个时钟。
         返回**实际可用**的部分（可能短于请求，也可能为空）。读指针只增不减。
+
+        ⚠️ 切片走**两段连续拷贝**，不用 `np.arange(lo,hi) % cap` 的花式索引
+        （`ocr` 代码审查 2026-09-20 报的 `player.py:217`）。实测（AEC 的真实调用
+        规模 n=4410）：花式索引 p50 **12.3µs** / max 93µs → 两段拷贝 p50 **0.8µs** /
+        max 4.6µs，**快 14.8×**，且少一次 `arange` 分配（实时相邻路径上的 GC 压力）。
+        绝对值本来就只有音频块预算（23220µs）的 **0.05%** —— 所以这**不是**
+        xrun 风险，是顺手清掉的一处浪费。
         """
         with self._far_lock:
             total = self._far_w
@@ -214,7 +239,15 @@ class Player:
             hi = min(int(start_frame) + max(0, int(n_frames)), total)
             if hi <= lo:
                 return np.zeros(0, dtype=np.int16)
-            return self._far[np.arange(lo, hi) % self._far_cap].copy()
+            n = hi - lo
+            a = lo % self._far_cap          # 窗口在环里的起点
+            if a + n <= self._far_cap:      # 不跨界
+                return self._far[a:a + n].copy()
+            k = self._far_cap - a           # 跨界：尾段 + 头段
+            out = np.empty(n, dtype=np.int16)
+            out[:k] = self._far[a:]
+            out[k:] = self._far[:n - k]
+            return out
 
     def cut_tag(self, tag: str) -> float:
         """把缓冲里该标签的音频整段切掉，返回切掉的秒数。

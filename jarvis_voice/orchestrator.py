@@ -267,6 +267,16 @@ class Orchestrator:
             self.log("JARVIS · 免提模式（无 AEC → 半双工：播出时不听麦克风，**不能插话打断**）")
             self.log("        仍可用仪表盘的「打断」按钮手动打断。Ctrl+C 退出")
         self.log("=" * 64)
+        # ---- 观测：把 AEC 对齐的未知量 B 报出来 ----
+        # `player.py` 在 2026-09-20 之前**从不读 `stream.latency`**，所以
+        # `aec_stream_delay_ms` 取多少一直靠推断（子代理审查 + ocr 都点出这点）。
+        # 启动时报出设备真实延迟，B 就从「未知」变「已知」。
+        _olat = self.player.output_latency_ms
+        self.log(f"[音频] 输出延迟 B = {_olat:.1f}ms" if _olat is not None
+                 else "[音频] 输出延迟 = 读不到（设备没报）")
+        self.log(f"       AEC = {'开' if self.aec is not None else '关'}"
+                 f" | far 读偏移 = {self.cfg.aec_stream_delay_ms}ms"
+                 f" | VAD 预滚 = {self.cfg.vad_pre_roll_ms}ms")
         burst_started_at: float | None = None   # 本次"语音爆发"的起点
         fired_for_this_speech = False
         silence_since: float | None = None      # 当前静音段从何时开始（None = 正在说话）
@@ -288,10 +298,14 @@ class Orchestrator:
                     if self.aec is not None:
                         # 播放期间多报一个 WebRTC 自己的语音概率 ——
                         # 留着事后定 aec_min_speech_prob 的阈值（先测量，再设门限）。
+                        # `dropped`/`xrun` 也带上：mic 队列溢出与采集侧溢出是两回事，
+                        # 不区分就查不出音频卡顿的根因（ocr 点出的观测盲区）。
                         BUS.emit("level", rms=rms,
-                                 speech_prob=round(self.aec.speech_probability, 3))
+                                 speech_prob=round(self.aec.speech_probability, 3),
+                                 dropped=self.mic.dropped, xrun=self.mic.status_flags)
                     else:
-                        BUS.emit("level", rms=rms)
+                        BUS.emit("level", rms=rms,
+                                 dropped=self.mic.dropped, xrun=self.mic.status_flags)
                     last_level = now
 
                 # ---- 半双工（免提模式）----
